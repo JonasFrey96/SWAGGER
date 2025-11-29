@@ -41,6 +41,8 @@ class GlobalGraphGenerator:
     boundary_increment: float = 0.2
     boundary_decay: float = 0.9
     boundary_cell_size: float = 0.05
+    connection_distance: float = 2.0
+    max_connections: int = 5
 
     global_graph: nx.Graph = field(default_factory=nx.Graph, init=False)
     _next_node_id: int = field(default=0, init=False)
@@ -56,6 +58,10 @@ class GlobalGraphGenerator:
         local_to_global: Dict = {}
         touched_nodes: Set[int] = set()
         seen_boundary_cells: Set[Tuple[int, int]] = set()
+        newly_added_nodes: Set[int] = set()  # ← Track which nodes are truly new
+
+        # Track existing nodes before processing
+        existing_global_nodes = set(self.global_graph.nodes())
 
         for node, data in local_graph.nodes(data=True):
             node_type = str(data.get("node_type", "")).lower()
@@ -81,8 +87,12 @@ class GlobalGraphGenerator:
             global_id = self._merge_or_add_node(world_xy, data)
             local_to_global[node] = global_id
             touched_nodes.add(global_id)
+            
+            # Track if this is a newly created node
+            if global_id not in existing_global_nodes:
+                newly_added_nodes.add(global_id)
 
-        # Add edges only between nodes mapped above
+        # Add edges from local graph
         local_edge_pairs: Set[Tuple[int, int]] = set()
         for src, dst, edata in local_graph.edges(data=True):
             g_src = local_to_global.get(src)
@@ -105,6 +115,37 @@ class GlobalGraphGenerator:
             n2 = self.global_graph.nodes[g_dst]["world"]
             dist = math.hypot(float(n1[0]) - float(n2[0]), float(n1[1]) - float(n2[1]))
             self.global_graph.add_edge(g_src, g_dst, weight=dist)
+
+        # NEW: Connect new nodes to nearby existing global nodes 
+
+        connection_distance = self.connection_distance 
+        max_connections = self.max_connections  # Limit connections per new node
+        
+        for new_node_id in newly_added_nodes:
+            new_world = self.global_graph.nodes[new_node_id]["world"]
+            new_xy = (float(new_world[0]), float(new_world[1]))
+            
+            # Find nearby existing global nodes
+            candidates = []
+            for existing_id in existing_global_nodes:
+                if existing_id not in self.global_graph.nodes:
+                    continue  # Node may have been removed
+                
+                existing_world = self.global_graph.nodes[existing_id]["world"]
+                existing_xy = (float(existing_world[0]), float(existing_world[1]))
+                
+                dist = math.hypot(new_xy[0] - existing_xy[0], new_xy[1] - existing_xy[1])
+                
+                if dist < connection_distance:
+                    # Check if path is collision-free (you may need to implement this)
+                    candidates.append((dist, existing_id))
+            
+            # Sort by distance and connect to closest nodes
+            candidates.sort()
+            for dist, existing_id in candidates[:max_connections]:
+                pair = tuple(sorted((new_node_id, existing_id)))
+                if not self.global_graph.has_edge(*pair):
+                    self.global_graph.add_edge(new_node_id, existing_id, weight=dist)
 
         # Clean up redundant edges after merging
         self._prune_redundant_edges()
@@ -168,7 +209,7 @@ class GlobalGraphGenerator:
 
     def _prune_redundant_edges(self) -> None:
         """Limit node degree by keeping only the closest neighbors."""
-        max_degree = 8  # Reduced back to 8 for cleaner graph
+        max_degree = 15  
         
         # Only prune every N frames to reduce overhead
         if not hasattr(self, '_prune_counter'):
