@@ -18,6 +18,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
+import torch
+
 
 import cupy as cp
 import cv2
@@ -138,6 +140,102 @@ class WaypointGraphGenerator:
     @property
     def graph(self) -> nx.Graph:
         return self._graph
+    
+    def _process_known_points_gpu(
+        self,
+        known_points,
+        inflated_for_skeleton
+    ):
+        """
+        GPU-accelerated processing of known world points:
+        - world → pixel using EXACT SAME math as world_to_pixel()
+        - bounds checking
+        - free-space filtering using inflated_for_skeleton
+        """
+
+        if known_points is None or len(known_points) == 0:
+            return [], [], []
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Convert known points → tensor (N,2)
+        kp = torch.tensor(known_points, dtype=torch.float32, device=device)  # (x,y)
+
+        # -------------- image shape + center --------------
+        H, W = inflated_for_skeleton.shape
+        cx_m = W / 2.0
+        cy_m = H / 2.0
+
+        # -------------- unpack world coords --------------
+        x_world = kp[:, 0]
+        y_world = kp[:, 1]
+
+        # -------------- translate into local centered frame --------------
+        x_local = x_world - self._x_offset
+        y_local = y_world - self._y_offset
+
+        # -------------- inverse rotation  --------------
+        cos_r = self._cos_rot
+        sin_r = self._sin_rot
+
+        x_unrot = cos_r * x_local + sin_r * y_local
+        y_unrot = -sin_r * x_local + cos_r * y_local
+
+        # -------------- "fix" step (your current identity logic) --------------
+        x_fix = x_unrot
+        y_fix = y_unrot
+
+        # -------------- convert to pixel indices --------------
+        col = (x_fix / self._resolution) + cx_m
+        row = -(y_fix / self._resolution) + cy_m
+
+        row_i = torch.round(row).long()
+        col_i = torch.round(col).long()
+
+        # -------------- bounds check --------------
+        mask = (row_i >= 0) & (row_i < H) & (col_i >= 0) & (col_i < W)
+        if mask.sum() == 0:
+            return [], [], []
+
+        row_i = row_i[mask]
+        col_i = col_i[mask]
+        kp_valid = kp[mask]
+
+        # -------------- free-space check (inflated_for_skeleton == 1) --------------
+        inflated_t = torch.tensor(
+            inflated_for_skeleton, dtype=torch.uint8, device=device
+        )
+        free_mask = inflated_t[row_i, col_i] == 1
+
+        if free_mask.sum() == 0:
+            return [], [], []
+
+        row_i = row_i[free_mask]
+        col_i = col_i[free_mask]
+        kp_valid = kp_valid[free_mask]
+
+        # -------------- convert back to python lists --------------
+        known_points_px = [
+            (int(r.item()), int(c.item()))
+            for r, c in zip(row_i, col_i)
+        ]
+
+        visible_known_world = [
+            (float(p[0].item()), float(p[1].item()))
+            for p in kp_valid
+        ]
+
+        pending_known_nodes = [
+            (
+                int(r.item()),
+                int(c.item()),
+                (float(p[0].item()), float(p[1].item()), 0.0)
+            )
+            for (r, c, p) in zip(row_i, col_i, kp_valid)
+        ]
+
+        return known_points_px, visible_known_world, pending_known_nodes
+
 
     def build_graph_from_grid_map(
         self,
@@ -173,8 +271,8 @@ class WaypointGraphGenerator:
         self._original_map = copy.deepcopy(image)
         self._occupancy_threshold = occupancy_threshold
         self._x_offset = x_offset
+        self._known_points = known_points
 
-        self._debug_print(f"[DEBUG internal] received x_offset={x_offset}, self._resolution={resolution}")
         self._debug_print(f"[DEBUG internal] effective world offset applied? {x_offset / resolution} pixels worth")
 
         # When using ROS coordinates, we need to add the image height to the y_offset
@@ -189,7 +287,7 @@ class WaypointGraphGenerator:
 
         # Check if map is completely free before performing distance transform
         free_map = (self._original_map > self._occupancy_threshold).astype(np.uint8)
-        self._debug_save_stage("01_free_map", free_map, color=True)
+        # self._debug_save_stage("01_free_map", free_map, color=True)
 
         if np.all(free_map):
             # Map is completely free (all values > threshold), create grid graph directly
@@ -201,46 +299,17 @@ class WaypointGraphGenerator:
 
         # Map has obstacles, perform distance transform
         self._distance_transform(free_map)
-        self._debug_save_stage("02_inflated_map", self._inflated_map)
-
-        # Modified: mask known points before skeletonization
-        #if not hasattr(self, "_visited_mask") or self._visited_mask is None:
-            # Initialize the persistent visited-mask once (same size as map)
-            #self._visited_mask = np.zeros_like(self._inflated_map, dtype=np.uint8)
+        # self._distance_transform_cuda(free_map)
 
         self._visited_mask = np.zeros_like(self._inflated_map, dtype=np.uint8)
-
         inflated_for_skeleton = self._inflated_map.copy()
-        self._debug_save_stage("03a1_inflated_for_skeleton", inflated_for_skeleton)
-        known_points_px: list[tuple[int, int]] = []
-        visible_known_world: list[tuple[float, float]] = []
-        pending_known_nodes: list[tuple[int, int, tuple[float, float, float]]] = []
-        if not known_points:
-            known_points = list(getattr(self, "_known_points", []))
 
-        self._debug_print(f"[DEBUG mask] known pixels: {len(known_points) if known_points else 0}")
-
-        if known_points:
-            for (x, y) in known_points:
-                pix = self._world_to_pixel(Point(x=x, y=y, z=0.0))
-                if pix is None:
-                    continue
-                row, col = pix
-                if 0 <= row < inflated_for_skeleton.shape[0] and 0 <= col < inflated_for_skeleton.shape[1]:
-                    if not self._is_free_pixel(row, col):
-                        self._debug_print(f"[DEBUG] Skipping known point {(x, y)} — falls in occupied space.")
-                        continue
-                    known_points_px.append((row, col))
-                    visible_known_world.append((x, y))
-                    world = self._pixel_to_world(row, col)
-                    world_tuple = self._point_to_tuple(world)
-                    pending_known_nodes.append((row, col, world_tuple))
-                else:
-                    self._debug_print(f"[DEBUG] Skipping known point {(x, y)} — outside current frame bounds.")
-
-            self._debug_print(f"[DEBUG] Converted {len(known_points_px)} known points inside frame.")
-
-        inflated_tmp = inflated_for_skeleton.copy()
+        # GPU-accelerated known-point processing
+        (
+            known_points_px,
+            visible_known_world,
+            pending_known_nodes
+        ) = self._process_known_points_gpu(known_points, inflated_for_skeleton)
 
         graph = nx.Graph()
 
@@ -316,99 +385,6 @@ class WaypointGraphGenerator:
         self._debug_print(f"[DEBUG] Known pts (world→pixel): {len(known_points_px)} visible this frame")
         self._debug_print(f"[DEBUG] New pts: {len(new_points_px)} total")
 
-        if True:
-            free_img = (inflated_for_skeleton * 255).astype(np.uint8)
-            free_img = cv2.cvtColor(free_img, cv2.COLOR_GRAY2BGR)
-
-            # color-code:
-            #   known points → magenta
-            #   free-space samples → red
-            #   skeleton pixels (if any) → green overlay
-            if hasattr(self, "_last_skeleton") and self._last_skeleton is not None:
-                skel_vis = (self._last_skeleton > 0).astype(np.uint8)
-                free_img[skel_vis == 1] = (0, 255, 0)
-
-            # optionally overlay known points in magenta (same scale)
-            if known_points_px is not None and len(known_points_px) > 0:
-                for (y, x) in known_points_px:
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 0, 255), -1)
-
-            # overlay persisted known nodes (magenta) ---
-            for node, data in graph.nodes(data=True):
-                ntype = str(data.get("node_type", "")).lower()
-                if "known" in ntype:
-                    pix = data.get("pixel")
-                    if pix is None and isinstance(node, tuple) and len(node) == 2:
-                        pix = node
-                    if pix is None:
-                        continue
-                    y, x = pix
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 0, 255), -1)
-
-            # overlay boundary nodes (cyan) ---
-            for node, data in graph.nodes(data=True):
-                ntype = str(data.get("node_type", "")).lower()
-                if "boundary" in ntype:
-                    y, x = node
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 255, 0), -1)
-
-            self._debug_save_stage("05a_free_space_samples", free_img, color=True)
-
-        # visualize new free-space points
-        self._debug_print(f"[DEBUG free-space] total new nodes in graph after sampling: {len(new_points_px)}")
-
-        if new_points_px is not None and len(new_points_px) > 0:
-            free_img = (inflated_for_skeleton * 255).astype(np.uint8)
-            free_img = cv2.cvtColor(free_img, cv2.COLOR_GRAY2BGR)
-
-            # color-code:
-            #   known points → magenta
-            #   free-space samples → red
-            #   skeleton pixels (if any) → green overlay
-            if hasattr(self, "_last_skeleton") and self._last_skeleton is not None:
-                skel_vis = (self._last_skeleton > 0).astype(np.uint8)
-                free_img[skel_vis == 1] = (0, 255, 0)
-
-            # draw free-space sample points as red dots
-            for (y, x) in new_points_px:
-                if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                    cv2.circle(free_img, (int(x), int(y)), 2, (0, 0, 255), -1)
-
-            # optionally overlay known points in magenta (same scale)
-            if known_points_px is not None and len(known_points_px) > 0:
-                for (y, x) in known_points_px:
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 0, 255), -1)
-
-            # overlay persisted known nodes (magenta) ---
-            for node, data in graph.nodes(data=True):
-                ntype = str(data.get("node_type", "")).lower()
-                if "known" in ntype:
-                    pix = data.get("pixel")
-                    if pix is None and isinstance(node, tuple) and len(node) == 2:
-                        pix = node
-                    if pix is None:
-                        continue
-                    y, x = pix
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 0, 255), -1)
-
-            # overlay boundary nodes (cyan) ---
-            for node, data in graph.nodes(data=True):
-                ntype = str(data.get("node_type", "")).lower()
-                if "boundary" in ntype:
-                    y, x = node
-                    if 0 <= y < free_img.shape[0] and 0 <= x < free_img.shape[1]:
-                        cv2.circle(free_img, (int(x), int(y)), 2, (255, 255, 0), -1)
-
-            self._debug_save_stage("05_free_space_samples", free_img, color=True)
-            self._debug_print(f"[DEBUG] Saved {len(new_points_px)} free-space samples to debug_stages/05_free_space_samples.png")
-        else:
-            self._debug_print("[DEBUG] No free-space samples to visualize.")
-
         boundary_nodes = sum(1 for _, d in graph.nodes(data=True) if d.get("node_type") == "boundary")
         free_nodes = sum(
             1
@@ -435,10 +411,6 @@ class WaypointGraphGenerator:
         # Add shortcuts
         if self._config.use_delaunay_shortcuts:
 
-            #edges_px = self.project_edges_to_current_frame(global_graph, inflated_for_skeleton.shape, x_offset, y_offset, rotation)
-            #for (p1, p2) in edges_px:
-            #    cv2.line(inflated_for_skeleton, (p1[1], p1[0]), (p2[1], p2[0]), color=255, thickness=1)
-
             for node in list(graph.nodes()):
                 data = graph.nodes[node]
                 if "pixel" not in data:
@@ -449,29 +421,6 @@ class WaypointGraphGenerator:
                     data["world"] = (x_w, y_w)
 
             self._add_delaunay_shortcuts(graph)
-            final_debug = cv2.cvtColor((self._inflated_map * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-            for (n1, n2, data) in graph.edges(data=True):
-                if "pixel" not in graph.nodes[n1] or "pixel" not in graph.nodes[n2]:
-                    continue
-                y1, x1 = map(int, graph.nodes[n1]["pixel"])
-                y2, x2 = map(int, graph.nodes[n2]["pixel"])
-
-                node1_type = str(graph.nodes[n1].get("node_type", "")).lower()
-                node2_type = str(graph.nodes[n2].get("node_type", "")).lower()
-                origin1 = graph.nodes[n1].get("origin")
-                origin2 = graph.nodes[n2].get("origin")
-
-                if "boundary" in (node1_type, node2_type):
-                    color = (255, 255, 0)  # cyan for boundary edges
-                elif origin1 == origin2 == "known":
-                    color = (255, 0, 255)  # magenta for known↔known
-                else:
-                    color = (0, 0, 255)  # red for edges touching new nodes
-
-                cv2.line(final_debug, (x1, y1), (x2, y2), color, 1)
-
-            self._debug_save_stage("06_final_graph", final_debug, color=True)
-            self._debug_print(f"[DEBUG] Delaunay shortcut edges added: {len(graph.edges)} total")
 
         # Add world coordinates to nodes
         #graph = self._to_world_coordinates(graph)
@@ -702,6 +651,59 @@ class WaypointGraphGenerator:
         self._inflated_map = (self._dist_transform < self._safety_distance / self._resolution).astype(np.uint8)
         # Unpad the distance transform to get the original map shape
         self._inflated_map = self._inflated_map[1:-1, 1:-1]
+
+    def _distance_transform_cuda(self, free_map: np.ndarray):
+        
+        try:
+            import cupy as cp
+            from cupyx.scipy.ndimage import distance_transform_edt
+            use_gpu = True
+        except Exception:
+            use_gpu = False
+
+        
+        free_map_padded = np.pad(
+            free_map,
+            ((1, 1), (1, 1)),
+            mode="constant",
+            constant_values=0,
+        )
+
+        
+        if use_gpu:
+            free_gpu = cp.asarray(free_map_padded.astype(np.uint8))
+
+            # CUDA Euclidean Distance Transform
+            dist_gpu = distance_transform_edt(free_gpu)
+
+            # STORE dist transform (for legacy users)
+            self._dist_transform = cp.asnumpy(dist_gpu)
+
+            safety_px = float(self._safety_distance) / float(self._resolution)
+
+            inflated_gpu = (dist_gpu < safety_px).astype(cp.uint8)
+
+            self._inflated_map = cp.asnumpy(inflated_gpu[1:-1, 1:-1])
+
+        
+        else:
+            self._logger.warning(
+                "[WARN] CuPy not available — falling back to CPU distance transform."
+            )
+
+            self._dist_transform = cv2.distanceTransform(
+                free_map_padded,
+                cv2.DIST_L2,
+                cv2.DIST_MASK_PRECISE,
+            )
+
+            self._inflated_map = (
+                self._dist_transform < self._safety_distance / self._resolution
+            ).astype(np.uint8)
+
+            self._inflated_map = self._inflated_map[1:-1, 1:-1]
+
+
 
     def _create_grid_graph(self, shape: tuple[int, int], grid_sample_distance: int) -> nx.Graph:
         """Create a grid graph for completely free maps with a margin from the borders."""
@@ -1395,7 +1397,7 @@ class WaypointGraphGenerator:
             self._merge_close_nodes(graph, threshold=self._config.merge_node_distance)
 
         # Remove isolated nodes and small subgraphs
-        graph.remove_nodes_from(list(nx.isolates(graph)))
+        # graph.remove_nodes_from(list(nx.isolates(graph)))
 
         # Find connected components and filter small ones
         components = list(nx.connected_components(graph))

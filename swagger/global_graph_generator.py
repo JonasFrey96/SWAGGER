@@ -44,13 +44,77 @@ class GlobalGraphGenerator:
     connection_distance: float = 2.0
     max_connections: int = 5
 
+    occ_grid: np.ndarray = None            # 255 = free, 0 = occupied
+    occ_resolution: float = 0.04
+    occ_center: Tuple[float, float] = (0.0, 0.0)   # world coords of grid center (user-provided)
+
+    _colliding_edges: Set[Tuple[int, int]] = field(default_factory=set, init=False)
+
+
     global_graph: nx.Graph = field(default_factory=nx.Graph, init=False)
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
     _boundary_probs: Dict[Tuple[int, int], float] = field(default_factory=dict, init=False)
 
-    def add_local_graph(self, local_graph: nx.Graph) -> None:
+    def _occ_origin(self):
+        if self.occ_grid is None:
+            return (0.0, 0.0)
+        
+        h, w = self.occ_grid.shape
+        ox = self.occ_center[0] + (w * self.occ_resolution) / 2.0
+        oy = self.occ_center[1] - (h * self.occ_resolution) / 2.0
+        return (ox, oy)
+    
+    def _edge_is_collision_free(self, p1, p2, p1_id, p2_id) -> bool:
+        """
+        Check straight-line collision using occupancy grid.
+        p1, p2 are (x, y, z) world coords.
+        Grid uses: 255 = free, 0 = occupied
+        """
+
+        if self.occ_grid is None:
+            return True
+
+        ox, oy = self._occ_origin()
+        res = self.occ_resolution
+        grid = self.occ_grid
+
+        x1, y1 = p1[:2]
+        x2, y2 = p2[:2]
+
+        dist = math.hypot(x2 - x1, y2 - y1)
+        step = res * 0.5
+        steps = max(2, int(dist / step))
+
+        for i in range(steps + 1):
+            t = i / steps
+            wx = x1 * (1 - t) + x2 * t
+            wy = y1 * (1 - t) + y2 * t
+
+            # Convert world → grid indices
+            gx = int((-wx + ox) / res)
+            gy = int((+wy - oy) / res)
+
+            # Out of bounds = collision
+            if gx < 0 or gy < 0 or gx >= grid.shape[1] or gy >= grid.shape[0]:
+                return False
+
+            # 0 = occupied, treat ANYTHING except 255 as unsafe
+            if grid[gy, gx] != 255:
+                self._colliding_edges.add(tuple(sorted((p1_id, p2_id))))
+                return False
+
+        return True
+
+
+
+    def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid) -> None:
+
         """Merge a local graph into the persistent global graph."""
+        occ_grid = np.rot90(occ_grid, 2)
+
+        self.occ_center = (occ_center_x, occ_center_y)
+        self.occ_grid = occ_grid
 
         if not 0.0 <= self.retention_factor <= 1.0:
             raise ValueError("retention_factor must be between 0 and 1")
@@ -58,10 +122,6 @@ class GlobalGraphGenerator:
         local_to_global: Dict = {}
         touched_nodes: Set[int] = set()
         seen_boundary_cells: Set[Tuple[int, int]] = set()
-        newly_added_nodes: Set[int] = set()  # ← Track which nodes are truly new
-
-        # Track existing nodes before processing
-        existing_global_nodes = set(self.global_graph.nodes())
 
         for node, data in local_graph.nodes(data=True):
             node_type = str(data.get("node_type", "")).lower()
@@ -87,12 +147,8 @@ class GlobalGraphGenerator:
             global_id = self._merge_or_add_node(world_xy, data)
             local_to_global[node] = global_id
             touched_nodes.add(global_id)
-            
-            # Track if this is a newly created node
-            if global_id not in existing_global_nodes:
-                newly_added_nodes.add(global_id)
 
-        # Add edges from local graph
+        # Add edges only between nodes mapped above
         local_edge_pairs: Set[Tuple[int, int]] = set()
         for src, dst, edata in local_graph.edges(data=True):
             g_src = local_to_global.get(src)
@@ -104,58 +160,28 @@ class GlobalGraphGenerator:
                 continue  # keep only one connection per pair from this local graph
             local_edge_pairs.add(pair)
 
-            if self.global_graph.has_edge(*pair):
-                n1 = self.global_graph.nodes[g_src]["world"]
-                n2 = self.global_graph.nodes[g_dst]["world"]
-                dist = math.hypot(float(n1[0]) - float(n2[0]), float(n1[1]) - float(n2[1]))
-                self.global_graph[g_src][g_dst]["weight"] = dist
-                continue
 
+            # Compute world coords
             n1 = self.global_graph.nodes[g_src]["world"]
             n2 = self.global_graph.nodes[g_dst]["world"]
             dist = math.hypot(float(n1[0]) - float(n2[0]), float(n1[1]) - float(n2[1]))
-            self.global_graph.add_edge(g_src, g_dst, weight=dist)
 
-        # NEW: Connect new nodes to nearby existing global nodes 
+            # Collision check
+            if not self._edge_is_collision_free(n1, n2, g_src, g_dst):
+                continue  # skip this edge entirely
 
-        connection_distance = self.connection_distance 
-        max_connections = self.max_connections  # Limit connections per new node
-        
-        for new_node_id in newly_added_nodes:
-            new_world = self.global_graph.nodes[new_node_id]["world"]
-            new_xy = (float(new_world[0]), float(new_world[1]))
-            
-            # Find nearby existing global nodes
-            candidates = []
-            for existing_id in existing_global_nodes:
-                if existing_id not in self.global_graph.nodes:
-                    continue  # Node may have been removed
-                
-                existing_world = self.global_graph.nodes[existing_id]["world"]
-                existing_xy = (float(existing_world[0]), float(existing_world[1]))
-                
-                dist = math.hypot(new_xy[0] - existing_xy[0], new_xy[1] - existing_xy[1])
-                
-                if dist < connection_distance:
-                    # Check if path is collision-free (you may need to implement this)
-                    candidates.append((dist, existing_id))
-            
-            # Sort by distance and connect to closest nodes
-            candidates.sort()
-            for dist, existing_id in candidates[:max_connections]:
-                pair = tuple(sorted((new_node_id, existing_id)))
-                if not self.global_graph.has_edge(*pair):
-                    self.global_graph.add_edge(new_node_id, existing_id, weight=dist)
+            # Add or update edge weight
+            if self.global_graph.has_edge(*pair):
+                self.global_graph[g_src][g_dst]["weight"] = dist
+            else:
+                self.global_graph.add_edge(g_src, g_dst, weight=dist)
+
 
         # Clean up redundant edges after merging
         self._prune_redundant_edges()
         
         self._decay_nodes(touched_nodes)
         self._decay_boundaries(seen_boundary_cells)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _merge_or_add_node(self, world_xy: Tuple[float, float], attrs: dict) -> int:
         """Merge with an existing node or create a new one."""
@@ -209,8 +235,11 @@ class GlobalGraphGenerator:
 
     def _prune_redundant_edges(self) -> None:
         """Limit node degree by keeping only the closest neighbors."""
-        max_degree = 15  
+        max_degree = 17  # Reduced back to 8 for cleaner graph
         
+        self.global_graph.remove_edges_from(self._colliding_edges)
+        self._colliding_edges.clear()  # reset for next frame
+
         # Only prune every N frames to reduce overhead
         if not hasattr(self, '_prune_counter'):
             self._prune_counter = 0
@@ -259,9 +288,7 @@ class GlobalGraphGenerator:
         cell = self.boundary_cell_size
         return (key[0] * cell + cell / 2.0, key[1] * cell + cell / 2.0)
 
-    # ------------------------------------------------------------------
-    # Accessors
-    # ------------------------------------------------------------------
+    
 
     def get_global_graph(self) -> nx.Graph:
         """Return the stitched global graph."""
