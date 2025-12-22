@@ -19,6 +19,9 @@ import math
 import cv2
 import numpy as np
 import networkx as nx
+import torch
+import cupy as cp
+import string
 
 
 @dataclass
@@ -41,8 +44,10 @@ class GlobalGraphGenerator:
     boundary_increment: float = 0.2
     boundary_decay: float = 0.9
     boundary_cell_size: float = 0.05
-    connection_distance: float = 2.0
-    max_connections: int = 5
+    max_connections: int = 10
+    pruning_frequency: int = 6 
+    max_candidate_edge_distance: float = 0.8
+    max_candidate_edge_search_distance: float = 10
 
     occ_grid: np.ndarray = None            # 255 = free, 0 = occupied
     occ_resolution: float = 0.04
@@ -64,181 +69,424 @@ class GlobalGraphGenerator:
         ox = self.occ_center[0] + (w * self.occ_resolution) / 2.0
         oy = self.occ_center[1] - (h * self.occ_resolution) / 2.0
         return (ox, oy)
-    
-    def _edge_is_collision_free(self, p1, p2, p1_id, p2_id) -> bool:
+
+
+    def edge_valid_kernel(self, width, height):
         """
-        Check straight-line collision using occupancy grid.
-        p1, p2 are (x, y, z) world coords.
-        Grid uses: 255 = free, 0 = occupied
+        CuPy ElementWiseKernel to check if the line segment (edge) between
+        two points [x0, y0] and [x1, y1] is valid (i.e., contains no obstacles).
+        Uses Bresenham's line algorithm for efficient grid traversal.
         """
+        _edge_valid_kernel = cp.ElementwiseKernel(
+            # U = unsigned char (bool)
+            in_params="raw U edges, raw U map",
+            out_params="raw U valid",
+            preamble=string.Template(
+                """
+                __device__ int get_map_idx(int x, int y) {
+                    // The map is flat: (y + x * height). Assuming (x,y) are in (width, height) format
+                    // but the kernel uses x for width index and y for height index.
+                    // Assuming row-major storage: idx = y * width + x
+                    // Or column-major (often for grid maps in robotics): idx = x * height + y
+                    // Let's stick to the common: idx = y * width + x for (row, col) = (y, x)
+                    return y * ${width} + x;
+                }
+                __device__ bool is_inside_map(int x, int y) {
+                    return (x >= 0 && y >= 0 && x<${width} && y<${height});
+                }
+                """
+            ).substitute(width=width, height=height),
+            operation=string.Template(
+                """
+                // Input: edges[i * 4 + 0, 1, 2, 3] = [x0, y0, x1, y1]
+                // Input: map[y * width + x] = 1 (clear/free) or 0 (occupied)
+                // Output: valid[i] = 1 (valid/clear) or 0 (invalid/obstacle)
+                int x0 = edges[i * 4 + 0];
+                int y0 = edges[i * 4 + 1];
+                int x1 = edges[i * 4 + 2];
+                int y1 = edges[i * 4 + 3];
+                // Bresenham's algorithm setup
+                int dx = abs(x1 - x0);
+                int sx = x0 < x1 ? 1 : -1;
+                int dy = -abs(y1 - y0);
+                int sy = y0 < y1 ? 1 : -1;
+                int error = dx + dy;
+                bool is_clear = true;
+                // Iterate over all cells along line
+                while (1){
+                    // 1. Check if the current cell (x0, y0) is inside and clear
+                    if (is_inside_map(x0, y0)){
+                        int idx = get_map_idx(x0, y0);
+                        // map is 1=free, 0=occupied. We check if it is NOT free (i.e., occupied)
+                        if (!map[idx]){
+                            is_clear = false;
+                            break;
+                        }
+                    }
+                    // 2. Termination condition
+                    if (x0 == x1 && y0 == y1){
+                        break;
+                    }
+                    // 3. Compute next grid cell index in line (Bresenham step)
+                    int e2 = 2 * error;
+                    if (e2 >= dy){ // x-step
+                        if(x0 == x1) break; // Re-check termination
+                        error += dy;
+                        x0 += sx;
+                    }
+                    if (e2 <= dx){ // y-step
+                        if (y0 == y1) break; // Re-check termination
+                        error += dx;
+                        y0 += sy;
+                    }
+                }
+                // Mark the validity
+                valid[i] = is_clear ? 1 : 0;
+                """
+            ).substitute(height=height, width=width),
+            name="edge_valid_kernel",
+        )
+        return _edge_valid_kernel
+
+
+
+    def batch_collision_check(self, p1_xy, p2_xy, p1_ids, p2_ids):
 
         if self.occ_grid is None:
-            return True
+            return torch.ones(len(p1_xy), dtype=torch.bool, device=p1_xy.device)
 
+        device = p1_xy.device
+
+        # -------------------------------
+        # 1. WORLD → GRID (VECTORIZED)
+        # -------------------------------
         ox, oy = self._occ_origin()
         res = self.occ_resolution
-        grid = self.occ_grid
 
-        x1, y1 = p1[:2]
-        x2, y2 = p2[:2]
+        wx0 = p1_xy[:, 0]
+        wy0 = p1_xy[:, 1]
+        wx1 = p2_xy[:, 0]
+        wy1 = p2_xy[:, 1]
 
-        dist = math.hypot(x2 - x1, y2 - y1)
-        step = res * 0.5
-        steps = max(2, int(dist / step))
+        gx0 = ((-wx0 + ox) / res).long()
+        gy0 = ((+wy0 - oy) / res).long()
+        gx1 = ((-wx1 + ox) / res).long()
+        gy1 = ((+wy1 - oy) / res).long()
 
-        for i in range(steps + 1):
-            t = i / steps
-            wx = x1 * (1 - t) + x2 * t
-            wy = y1 * (1 - t) + y2 * t
+        edges_torch = torch.stack([gx0, gy0, gx1, gy1], dim=1)
 
-            # Convert world → grid indices
-            gx = int((-wx + ox) / res)
-            gy = int((+wy - oy) / res)
+        # -------------------------------
+        # 2. TORCH → CUPY TRANSFER
+        # -------------------------------
+        edges_cp = cp.asarray(edges_torch.to(torch.uint8).contiguous())
+        grid_cp  = cp.asarray((self.occ_grid == 255).astype(np.uint8).flatten())
 
-            # Out of bounds = collision
-            if gx < 0 or gy < 0 or gx >= grid.shape[1] or gy >= grid.shape[0]:
-                return False
+        H, W = self.occ_grid.shape
 
-            # 0 = occupied, treat ANYTHING except 255 as unsafe
-            if grid[gy, gx] != 255:
-                self._colliding_edges.add(tuple(sorted((p1_id, p2_id))))
-                return False
+        # -------------------------------
+        # 3. RUN CUDA KERNEL
+        # -------------------------------
+        valid_cp = cp.zeros(len(edges_cp), dtype=cp.uint8)
 
-        return True
+        kernel = self.edge_valid_kernel(W, H)
+        kernel(edges_cp, grid_cp, valid_cp, size=len(edges_cp))
+
+        # -------------------------------
+        # 4. CUPY → TORCH MASK
+        # -------------------------------
+        valid_np = cp.asnumpy(valid_cp)
+        valid_torch = torch.from_numpy(valid_np.astype(np.bool_)).to(device)
+
+        return valid_torch
+    
+    def quantize(world_xy, resolution=0.04):
+        """
+        Convert world coordinates to quantized grid cell key.
+        """
+        xq = int(world_xy[0] // resolution)
+        yq = int(world_xy[1] // resolution)
+        return (xq, yq)
 
 
 
-    def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid) -> None:
+    def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid, resolution) -> None:
+        """Merge a local graph into the persistent global graph with optimized vectorization."""
 
-        """Merge a local graph into the persistent global graph."""
-        occ_grid = np.rot90(occ_grid, 2)
+        
 
+        occ_grid = np.rot90(occ_grid, 2)  # To account for the occ grid convetion as per GridMap
         self.occ_center = (occ_center_x, occ_center_y)
         self.occ_grid = occ_grid
+        self.occ_resolution = resolution
 
         if not 0.0 <= self.retention_factor <= 1.0:
             raise ValueError("retention_factor must be between 0 and 1")
 
-        local_to_global: Dict = {}
-        touched_nodes: Set[int] = set()
-        seen_boundary_cells: Set[Tuple[int, int]] = set()
-
-        for node, data in local_graph.nodes(data=True):
-            node_type = str(data.get("node_type", "")).lower()
-            if node_type == "skeleton":
-                continue  # never ingest skeleton nodes
-
-            world = data.get("world")
-            if world is None:
-                continue
-            world_xy = (float(world[0]), float(world[1]))
-
-            if node_type == "boundary":
-                key = self._quantize(world_xy)
-                seen_boundary_cells.add(key)
-                prob = self._boundary_probs.get(key, 0.0)
-                prob = min(1.0, prob + self.boundary_increment)
-                self._boundary_probs[key] = prob
-                continue
-
-            if node_type not in {"free_space", "known"}:
-                continue
-
-            global_id = self._merge_or_add_node(world_xy, data)
-            local_to_global[node] = global_id
-            touched_nodes.add(global_id)
-
-        # Add edges only between nodes mapped above
-        local_edge_pairs: Set[Tuple[int, int]] = set()
-        for src, dst, edata in local_graph.edges(data=True):
-            g_src = local_to_global.get(src)
-            g_dst = local_to_global.get(dst)
-            if g_src is None or g_dst is None or g_src == g_dst:
-                continue
-            pair = tuple(sorted((g_src, g_dst)))
-            if pair in local_edge_pairs:
-                continue  # keep only one connection per pair from this local graph
-            local_edge_pairs.add(pair)
-
-
-            # Compute world coords
-            n1 = self.global_graph.nodes[g_src]["world"]
-            n2 = self.global_graph.nodes[g_dst]["world"]
-            dist = math.hypot(float(n1[0]) - float(n2[0]), float(n1[1]) - float(n2[1]))
-
-            # Collision check
-            if not self._edge_is_collision_free(n1, n2, g_src, g_dst):
-                continue  # skip this edge entirely
-
-            # Add or update edge weight
-            if self.global_graph.has_edge(*pair):
-                self.global_graph[g_src][g_dst]["weight"] = dist
-            else:
-                self.global_graph.add_edge(g_src, g_dst, weight=dist)
-
-
-        # Clean up redundant edges after merging
-        self._prune_redundant_edges()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        self._decay_nodes(touched_nodes)
-        self._decay_boundaries(seen_boundary_cells)
+        global_ids = list(self.global_graph.nodes())
+        if global_ids:
+            global_pos = torch.tensor(
+                [self.global_graph.nodes[n]["world"][:2] for n in global_ids],
+                dtype=torch.float32,
+                device=device
+            )
+        else:
+            global_pos = torch.empty((0, 2), dtype=torch.float32, device=device)
 
-    def _merge_or_add_node(self, world_xy: Tuple[float, float], attrs: dict) -> int:
-        """Merge with an existing node or create a new one."""
-        best_node = None
-        best_dist = self.merge_distance
-        for node_id, data in self.global_graph.nodes(data=True):
-            existing_world = data.get("world")
-            if existing_world is None:
-                continue
-            dist = math.hypot(world_xy[0] - float(existing_world[0]), world_xy[1] - float(existing_world[1]))
-            if dist < best_dist:
-                best_dist = dist
-                best_node = node_id
+        
 
-        if best_node is None:
-            node_id = self._next_node_id
-            self._next_node_id += 1
-            z = 0.0
-            if isinstance(attrs.get("world"), (tuple, list)) and len(attrs["world"]) >= 3:
-                z = float(attrs["world"][2])
-            node_data = {
-                "world": (world_xy[0], world_xy[1], z),
-                "node_type": "free_space",
-                "origin": attrs.get("origin", "new"),
-            }
-            self.global_graph.add_node(node_id, **node_data)
-            self._node_usage[node_id] = 1.0
-            return node_id
+        """
+        ############# LOCAL NODE MERGING TO GLOBAL START ##################
+        """
+            
+            
+        
+        merge_start = torch.cuda.Event(enable_timing=True)
+        merge_end = torch.cuda.Event(enable_timing=True)
+        merge_start.record()
 
-        # Merge into existing node
-        data = self.global_graph.nodes[best_node]
-        existing_world = data.get("world", (world_xy[0], world_xy[1], 0.0))
-        data["world"] = (world_xy[0], world_xy[1], existing_world[2])
-        data["origin"] = attrs.get("origin", data.get("origin", "new"))
-        self._node_usage[best_node] = 1.0
-        return best_node
+        local_ids, self._next_node_id = self.tensor_merge_local_nodes(
+            local_graph,
+            self.global_graph,
+            self._next_node_id,
+            self.merge_distance,
+            device=device
+        )
 
-    def _decay_nodes(self, touched: Set[int]) -> None:
-        threshold = 1e-3
-        to_remove = []
-        for node_id in list(self._node_usage.keys()):
-            if node_id in touched:
-                self._node_usage[node_id] = 1.0
-                continue
-            self._node_usage[node_id] *= self.retention_factor
-            if self._node_usage[node_id] < threshold:
-                to_remove.append(node_id)
-        for node_id in to_remove:
-            self.global_graph.remove_node(node_id)
-            self._node_usage.pop(node_id, None)
+        merge_end.record()
+        torch.cuda.synchronize()
+        local_merge_ms = merge_start.elapsed_time(merge_end)
+        
+
+        if not local_ids:
+            return
+        
+
+        """
+        ############# LOCAL NODE MERGING TO GLOBAL END ##################
+        """
+        
+        """
+        ############# CANDIDATE EDGE SELECTION START ##################
+        """
+
+        cand_start = torch.cuda.Event(enable_timing=True)
+        cand_end = torch.cuda.Event(enable_timing=True)
+        cand_start.record()
+        
+        local_pos = torch.tensor(
+            [self.global_graph.nodes[n]["world"][:2] for n in local_ids],
+            dtype=torch.float32,
+            device=device
+        )
+        
+        # Compute centroid and filter candidates (all on GPU)
+        centroid = local_pos.mean(dim=0)
+        mask = torch.norm(global_pos - centroid, dim=1) < self.max_candidate_edge_search_distance
+
+        
+        candidate_pos = global_pos[mask]
+        global_ids_tensor = torch.tensor(global_ids, device=device, dtype=torch.int64)
+        candidate_ids_tensor = global_ids_tensor[mask]
+        
+        if len(candidate_pos) == 0:
+            return
+        
+        dists = torch.cdist(local_pos, candidate_pos, p=2)
+        
+        # Find connections within threshold
+        valid_mask = dists < self.max_candidate_edge_distance
+        local_idx, cand_idx = torch.nonzero(valid_mask, as_tuple=True)
+
+
+        
+        if len(local_idx) == 0:
+            return
+        
+        local_ids_tensor = torch.tensor(local_ids, device=device, dtype=torch.int64)
+
+        local_nodes_temp = local_ids_tensor[local_idx]
+        global_nodes_temp = candidate_ids_tensor[cand_idx]
+        no_self_loop_mask = local_nodes_temp != global_nodes_temp
+
+        local_idx = local_idx[no_self_loop_mask]
+        cand_idx = cand_idx[no_self_loop_mask]
+        
+        local_nodes = local_ids_tensor[local_idx]
+        global_nodes = candidate_ids_tensor[cand_idx]
+        weights = dists[local_idx, cand_idx]
+
+        cand_end.record()
+        torch.cuda.synchronize()
+        cand_select_ms = cand_start.elapsed_time(cand_end)
+
+        """
+        ############# CANDIDATE EDGE SELECTION END ##################
+        """
+
+
+
+        """
+        ############# COLLISION FILTER START ##################
+        """
+
+
+        # PyTorch CUDA event (your wrapper)
+        coll_start = torch.cuda.Event(enable_timing=True)
+        coll_end = torch.cuda.Event(enable_timing=True)
+        coll_start.record()
+
+        # ------------------- ADDED CUPY TIMING --------------------
+        cupy_start = cp.cuda.Event()
+        cupy_end = cp.cuda.Event()
+        cupy_start.record()
+        # -----------------------------------------------------------
+
+        p1 = local_pos[local_idx]
+        p2 = candidate_pos[cand_idx]
+
+        collision_free_mask = self.batch_collision_check(
+            p1, p2,
+            local_nodes,
+            global_nodes
+        )
+
+        # ------------------- END CUPY TIMING -----------------------
+        cupy_end.record()
+        cupy_end.synchronize()
+        cupy_kernel_ms = cp.cuda.get_elapsed_time(cupy_start, cupy_end)
+        # -----------------------------------------------------------
+
+        local_nodes = local_nodes[collision_free_mask]
+        global_nodes = global_nodes[collision_free_mask]
+        weights = weights[collision_free_mask]
+
+        coll_end.record()
+        torch.cuda.synchronize()
+        collision_ms = coll_start.elapsed_time(coll_end)
+
+
+        """
+        ############# COLLISION FILTER END ##################
+        """
+
+
+        """
+        ############# ADDING EDGES TO THE GRAPH START ##################
+        """
+        
+        add_start = torch.cuda.Event(enable_timing=True)
+        add_end = torch.cuda.Event(enable_timing=True)
+        add_start.record()
+
+        edges = list(zip(
+            local_nodes.cpu().tolist(),
+            global_nodes.cpu().tolist(),
+            weights.cpu().tolist()
+        ))
+        self.global_graph.add_weighted_edges_from(edges)
+
+        add_end.record()
+        torch.cuda.synchronize()
+        add_edges_ms = add_start.elapsed_time(add_end)
+
+        """
+        ############# ADDING EDGES TO THE GRAPH END ##################
+        """
+        
+        self._prune_redundant_edges()
+
+
+    def tensor_merge_local_nodes(self, local_graph, global_graph, next_node_id, merge_distance, device="cuda"):
+        """
+        Merge local graph nodes into global graph using fully vectorized GPU operations.
+
+        - Ignores node_type filtering and boundary logic (all nodes treated as free_space)
+        - Returns local_ids like the original loop
+        """
+
+        # -------------------------
+        # Extract local nodes
+        # -------------------------
+        local_nodes = list(local_graph.nodes())
+        if len(local_nodes) == 0:
+            return [], next_node_id
+
+        local_worlds = torch.tensor(
+            [local_graph.nodes[n]["world"] for n in local_nodes],
+            dtype=torch.float32,
+            device=device
+        )  # (N, D)
+        N = local_worlds.shape[0]
+
+        # -------------------------
+        # Extract global nodes
+        # -------------------------
+        global_nodes = list(global_graph.nodes())
+        if len(global_nodes) > 0:
+            global_worlds = torch.tensor(
+                [global_graph.nodes[n]["world"] for n in global_nodes],
+                dtype=torch.float32,
+                device=device
+            )  # (M, D)
+            global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
+        else:
+            global_worlds = torch.empty((0, local_worlds.shape[1]), device=device)
+            global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
+
+        # -------------------------
+        # CASE 1: Empty global graph
+        # -------------------------
+        if global_worlds.numel() == 0:
+            new_ids = torch.arange(next_node_id, next_node_id + N, device=device, dtype=torch.long)
+            final_ids = new_ids
+            new_local_mask = torch.ones(N, dtype=torch.bool, device=device)
+            updated_next_id = next_node_id + N
+        else:
+            # -------------------------
+            # Compute pairwise distances
+            # -------------------------
+            dists = torch.cdist(local_worlds, global_worlds)  # (N, M)
+
+            # -------------------------
+            # Find closest global for each local
+            # -------------------------
+            min_dists, min_idx = torch.min(dists, dim=1)
+            merge_mask = min_dists < merge_distance    # (N,)
+            merged_ids = global_ids_tensor[min_idx]    # (N,)
+
+            # -------------------------
+            # Assign new IDs
+            # -------------------------
+            new_local_mask = ~merge_mask
+            num_new = new_local_mask.sum()
+            new_ids = torch.arange(next_node_id, next_node_id + num_new, device=device, dtype=torch.long)
+
+            final_ids = merged_ids.clone()
+            final_ids[new_local_mask] = new_ids
+            updated_next_id = next_node_id + num_new
+
+        # -------------------------
+        # Update global graph with new nodes
+        # -------------------------
+        for i, nid in enumerate(final_ids.cpu().tolist()):
+            if new_local_mask[i]:
+                world = local_worlds[i].cpu().tolist()
+                global_graph.add_node(nid, world=tuple(world), node_type="free_space", origin="new")
+            # Optional: mark usage _node_usage[nid] = 1.0
+
+        # -------------------------
+        # Return local_ids in same order as original loop
+        # -------------------------
+        local_ids = final_ids.cpu().tolist()
+        return local_ids, updated_next_id
+
+    
 
     def _prune_redundant_edges(self) -> None:
         """Limit node degree by keeping only the closest neighbors."""
-        max_degree = 17  # Reduced back to 8 for cleaner graph
-        
-        self.global_graph.remove_edges_from(self._colliding_edges)
-        self._colliding_edges.clear()  # reset for next frame
+        max_degree = self.max_connections
 
         # Only prune every N frames to reduce overhead
         if not hasattr(self, '_prune_counter'):
@@ -246,7 +494,7 @@ class GlobalGraphGenerator:
         self._prune_counter += 1
         
         # Only run every 10 frames (less frequent)
-        if self._prune_counter % 10 != 0:
+        if self._prune_counter % self.pruning_frequency != 0:
             return
         
         edges_to_remove = set()  # Use set to avoid duplicates
@@ -256,6 +504,7 @@ class GlobalGraphGenerator:
             degree = len(neighbors)
             
             # Only prune if extremely over-connected
+            # print(degree)
             if degree <= max_degree:
                 continue
             

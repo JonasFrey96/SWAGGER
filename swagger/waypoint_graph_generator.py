@@ -20,6 +20,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 import torch
 
+import math
+import numpy as np
+import torch
+import torch.nn.functional as F
+import networkx as nx
+
 
 import cupy as cp
 import cv2
@@ -1742,11 +1748,11 @@ class WaypointGraphGenerator:
         if not cleaned_nodes:
             self._logger.warning("[WARN] No valid pixel nodes for nearest-node map.")
             return
+        
 
         graph_pixels = np.array(cleaned_nodes, dtype=np.int32)
         node_map = self._node_map.reshape(-1)
         WaypointGraphGenerator._flood_fill_numba(node_map, graph_pixels, width)
-
         self._logger.info("Nearest node map built")
 
     def _to_pixels(self, meters: float) -> float:
