@@ -15,79 +15,44 @@
 
 import copy
 import logging
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-import torch
 
-import math
 import numpy as np
-import torch
-import torch.nn.functional as F
-import networkx as nx
 
-
-import cupy as cp
 import cv2
+
 import networkx as nx
 import numba
-import numpy as np
-import skan
-from cucim.skimage.morphology import thin
-from rtree import index
 from scipy.spatial import Delaunay, cKDTree
+from rtree import index
 
 from swagger.logger import Logger
 from swagger.models import Point
 from swagger.utils import pixel_to_world, world_to_pixel
-
-# Modified --- added math
-import math
-
-@dataclass
-class Color:
-    r: int  # Red value
-    g: int  # Green value
-    b: int  # Blue value
-
-    def __post_init__(self):
-        for color, name in [(self.r, "Red"), (self.g, "Green"), (self.b, "Blue")]:
-            if not (0 <= color <= 255):
-                raise ValueError(f"{name} value must be between 0 and 255")
-
-    def to_tuple(self) -> tuple[int, int, int]:
-        return self.r, self.g, self.b
-
 
 @dataclass
 class WaypointGraphGeneratorConfig:
     """Configuration for waypoint graph generation algorithm.
 
     All distance parameters are specified in meters and are converted
-    to pixel units internally based on the resolution when needed.
+    to pixel units internally based on the resolution.
     """
-
     # Graph generation parameters (in meters)
-    skeleton_sample_distance: float = 1.5  # Distance between samples along skeleton image
-    boundary_inflation_factor: float = 1.5  # Factor to inflate boundaries by safety distance (unitless)
-    boundary_sample_distance: float = 2.5  # Distance between samples along contour
+    boundary_inflation_factor: float = 1.5      # Factor to inflate boundaries by safety distance (unitless)
+    boundary_sample_distance: float = 2.5       # Distance between samples along contour
     free_space_sampling_threshold: float = 1.5  # Maximum distance from obstacles
 
     # Graph pruning parameters (in meters)
-    merge_node_distance: float = 0.25  # Maximum distance to merge nodes
-    min_subgraph_length: float = 0.25  # Minimum total edge length to keep
-
-    # Colors for visualization
-    edge_color: Color = field(default_factory=lambda: Color(r=0, g=0, b=255))
-    node_color: Color = field(default_factory=lambda: Color(r=255, g=0, b=0))
+    merge_node_distance: float = 0.25   # Maximum distance to merge nodes
+    min_subgraph_length: float = 0.25   # Minimum total edge length to keep
 
     # Function flags
-    use_skeleton_graph: bool = True
     use_boundary_sampling: bool = True
     use_free_space_sampling: bool = True
     use_delaunay_shortcuts: bool = True
     prune_graph: bool = True
-    
+
     # Debug flag to control debug file output
     debug: bool = False
 
@@ -95,7 +60,6 @@ class WaypointGraphGeneratorConfig:
         """Validate configuration parameters after initialization."""
         # List of float parameters that must be positive
         distance_params = [
-            "skeleton_sample_distance",
             "boundary_sample_distance",
             "free_space_sampling_threshold",
             "merge_node_distance",
@@ -111,137 +75,41 @@ class WaypointGraphGeneratorConfig:
         if self.boundary_inflation_factor <= 1.0:
             raise ValueError("Parameter 'boundary_inflation_factor' must be greater than 1.0")
 
-
 class WaypointGraphGenerator:
+    """Generates a waypoint graph from an occupancy grid map."""
     def __init__(
-        self, config: WaypointGraphGeneratorConfig = WaypointGraphGeneratorConfig(), logger_level: int = logging.INFO
+        self,
+        config: WaypointGraphGeneratorConfig = WaypointGraphGeneratorConfig(),
+        logger_level: int = logging.INFO
     ):
-        self._graph: nx.Graph | None = None  # Store the current graph
-        self._original_map: np.ndarray | None = None  # Store original map for visualization
-        # Store inflated map for collision checks, shape is the same as the original map
-        self._inflated_map: np.ndarray | None = None
-        self._config = config  # Store graph generation configuration
-        self._resolution: float | None = None  # Store resolution for coordinate conversion
+        self._graph: nx.Graph | None = None             # Store the current graph
+        self._original_map: np.ndarray | None = None    # Store original map for visualization
+        self._inflated_map: np.ndarray | None = None    # Store inflated occupancy map for obstacle avoidance
+
+        self._config = config if config is not None else WaypointGraphGeneratorConfig()
+
+        self._resolution: float | None = None       # Store resolution for coordinate conversion
         self._safety_distance: float | None = None  # Store robot radius for visualization
-        self._occupancy_threshold: int = 127  # Store occupancy threshold
-        # Store transform parameters
+        self._occupancy_threshold: int = 127        # Store occupancy threshold
+
+        # Store transform parameters (in meters)
         self._x_offset: float = 0.0
         self._y_offset: float = 0.0
         self._rotation: float = 0.0  # Rotation in radians
         self._cos_rot: float = 1.0
         self._sin_rot: float = 0.0
-        # Initialize logger
+
         self._logger = Logger(__name__, level=logger_level)
 
-        self._node_map: np.ndarray | None = (
-            None  # Map of nodes for quick lookup, pixel values are node indices if not NaN
-        )
-        self._known_points: list[tuple[float, float]] = []
-
-    def _debug_print(self, *args, **kwargs):
-        """Print debug messages only if debug flag is enabled."""
-        if self._config.debug:
-            print(*args, **kwargs)
+        self._node_map: np.ndarray | None = None  # Nearest node map for fast lookup
 
     @property
     def graph(self) -> nx.Graph:
         return self._graph
-    
-    def _process_known_points_gpu(
-        self,
-        known_points,
-        inflated_for_skeleton
-    ):
-        """
-        GPU-accelerated processing of known world points:
-        - world → pixel using EXACT SAME math as world_to_pixel()
-        - bounds checking
-        - free-space filtering using inflated_for_skeleton
-        """
 
-        if known_points is None or len(known_points) == 0:
-            return [], [], []
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Convert known points → tensor (N,2)
-        kp = torch.tensor(known_points, dtype=torch.float32, device=device)  # (x,y)
-
-        # -------------- image shape + center --------------
-        H, W = inflated_for_skeleton.shape
-        cx_m = W / 2.0
-        cy_m = H / 2.0
-
-        # -------------- unpack world coords --------------
-        x_world = kp[:, 0]
-        y_world = kp[:, 1]
-
-        # -------------- translate into local centered frame --------------
-        x_local = x_world - self._x_offset
-        y_local = y_world - self._y_offset
-
-        # -------------- inverse rotation  --------------
-        cos_r = self._cos_rot
-        sin_r = self._sin_rot
-
-        x_unrot = cos_r * x_local + sin_r * y_local
-        y_unrot = -sin_r * x_local + cos_r * y_local
-
-        # -------------- "fix" step (your current identity logic) --------------
-        x_fix = x_unrot
-        y_fix = y_unrot
-
-        # -------------- convert to pixel indices --------------
-        col = (x_fix / self._resolution) + cx_m
-        row = -(y_fix / self._resolution) + cy_m
-
-        row_i = torch.round(row).long()
-        col_i = torch.round(col).long()
-
-        # -------------- bounds check --------------
-        mask = (row_i >= 0) & (row_i < H) & (col_i >= 0) & (col_i < W)
-        if mask.sum() == 0:
-            return [], [], []
-
-        row_i = row_i[mask]
-        col_i = col_i[mask]
-        kp_valid = kp[mask]
-
-        # -------------- free-space check (inflated_for_skeleton == 1) --------------
-        inflated_t = torch.tensor(
-            inflated_for_skeleton, dtype=torch.uint8, device=device
-        )
-        free_mask = inflated_t[row_i, col_i] == 1
-
-        if free_mask.sum() == 0:
-            return [], [], []
-
-        row_i = row_i[free_mask]
-        col_i = col_i[free_mask]
-        kp_valid = kp_valid[free_mask]
-
-        # -------------- convert back to python lists --------------
-        known_points_px = [
-            (int(r.item()), int(c.item()))
-            for r, c in zip(row_i, col_i)
-        ]
-
-        visible_known_world = [
-            (float(p[0].item()), float(p[1].item()))
-            for p in kp_valid
-        ]
-
-        pending_known_nodes = [
-            (
-                int(r.item()),
-                int(c.item()),
-                (float(p[0].item()), float(p[1].item()), 0.0)
-            )
-            for (r, c, p) in zip(row_i, col_i, kp_valid)
-        ]
-
-        return known_points_px, visible_known_world, pending_known_nodes
-
+    # ==========================================================
+    # Public API
+    # ==========================================================
 
     def build_graph_from_grid_map(
         self,
@@ -252,10 +120,8 @@ class WaypointGraphGenerator:
         x_offset: float = 0.0,
         y_offset: float = 0.0,
         rotation: float = 0.0,
-        known_points: list = None, # Modified --- added the concept of known points
     ) -> nx.Graph:
-        """
-        Build a waypoint graph from an occupancy grid map.
+        """Build a waypoint graph from an occupancy grid map.
 
         Args:
             image: Occupancy grid (0-255, where values <= threshold are considered occupied)
@@ -269,6 +135,10 @@ class WaypointGraphGenerator:
         Returns:
             NetworkX.Graph object containing the waypoint graph
         """
+        # --------------------------------------------------------
+        # Initialize map and transform parameters
+        # --------------------------------------------------------
+
         self._image_shape = image.shape[:2]
 
         self._logger.info("Building graph from grid map...")
@@ -277,163 +147,85 @@ class WaypointGraphGenerator:
         self._original_map = copy.deepcopy(image)
         self._occupancy_threshold = occupancy_threshold
         self._x_offset = x_offset
-        self._known_points = known_points
-
-        self._debug_print(f"[DEBUG internal] effective world offset applied? {x_offset / resolution} pixels worth")
 
         # When using ROS coordinates, we need to add the image height to the y_offset
         # This shifts the origin from top-left to bottom-left
         image_height = image.shape[0]
-        #self._y_offset = y_offset + (image_height * resolution)  # Add image height in meters
+        #self._y_offset = y_offset + (image_height * resolution)    # Add image height in meters
         self._y_offset = y_offset
 
         self._cos_rot = np.cos(rotation)
         self._sin_rot = np.sin(rotation)
         self._node_map = None
 
-        # Check if map is completely free before performing distance transform
+        # --------------------------------------------------------
+        # Check for trivial case: completely free map
+        # --------------------------------------------------------
+
         free_map = (self._original_map > self._occupancy_threshold).astype(np.uint8)
-        # self._debug_save_stage("01_free_map", free_map, color=True)
 
         if np.all(free_map):
             # Map is completely free (all values > threshold), create grid graph directly
             self._graph = self._create_grid_graph(
-                image.shape, grid_sample_distance=self._to_pixels_int(self._config.free_space_sampling_threshold)
+                image.shape,
+                grid_sample_distance=self._to_pixels_int(self._config.free_space_sampling_threshold)
             )
             self._build_nearest_node_map(self._graph)
             return self._graph
 
-        # Map has obstacles, perform distance transform
+        # --------------------------------------------------------
+        # Inflate obstacles using distance transform
+        # --------------------------------------------------------
+
         self._distance_transform(free_map)
-        # self._distance_transform_cuda(free_map)
 
-        self._visited_mask = np.zeros_like(self._inflated_map, dtype=np.uint8)
-        inflated_for_skeleton = self._inflated_map.copy()
-
-        # GPU-accelerated known-point processing
-        (
-            known_points_px,
-            visible_known_world,
-            pending_known_nodes
-        ) = self._process_known_points_gpu(known_points, inflated_for_skeleton)
+        # --------------------------------------------------------
+        # Build initial graph from boundary (contour) sampling
+        # --------------------------------------------------------
 
         graph = nx.Graph()
 
-        # ------------------------------------------------------------
-        # Build graph from the skeleton of the map
-        if self._config.use_skeleton_graph:
-            skeleton_graph = self._build_graph_from_skeleton(
-                skeleton_sample_distance=self._to_pixels_int(self._config.skeleton_sample_distance)
-            )
-        else:
-            graph = nx.Graph()
-
-        for row, col, world_tuple in pending_known_nodes:
-            if (row, col) not in graph:
-                graph.add_node(
-                    (row, col),
-                    node_type="known",
-                    pixel=(row, col),
-                    world=world_tuple,
-                    origin="known",
-                )
-
-        # Sample nodes along obstacle boundaries
         if self._config.use_boundary_sampling:
             self._sample_obstacle_boundaries(
-                graph, sample_distance=self._to_pixels_int(self._config.boundary_sample_distance)
+                graph,
+                sample_distance=self._to_pixels_int(self._config.boundary_sample_distance)
             )
 
+        # --------------------------------------------------------
+        # Sample free space for additional waypoints
+        # --------------------------------------------------------
+
         new_points_px = []
-        # Modified --- sampling known points, else sample points in free space
         if self._config.use_free_space_sampling:
-            if known_points is not None and len(known_points) > 0:
-                # Convert known world points → pixel coordinates
-                known_points_px = [
-                    self._world_to_pixel(Point(x=x, y=y, z=0.0))
-                    for (x, y) in known_points
-                ]
-
-                # Filter out any None or malformed points (outside current map)
-                known_points_px = [
-                    p for p in known_points_px
-                    if p is not None and len(p) == 2
-                ]
-
-                if len(known_points_px) == 0:
-                    self._logger.warning(
-                        "[WARN] All known points were out of frame — skipping incremental sampling."
-                    )
-                    new_points_px = []
-                else:
-                    new_points_px = self._sample_free_space_incremental(
-                        graph,
-                        visible_known_world,
-                        distance_threshold=self._to_pixels_int(
-                            self._config.free_space_sampling_threshold
-                        )
-                    )
-            else:
-                self._debug_print(f"[DEBUG] Entered sample_free_space")
-                new_points_px = self._sample_free_space(
-                    graph,
-                    distance_threshold=self._to_pixels_int(
-                        self._config.free_space_sampling_threshold
-                    ),
+            new_points_px = self._sample_free_space(
+                graph,
+                distance_threshold=self._to_pixels_int(
+                    self._config.free_space_sampling_threshold
                 )
+            )
 
-        # Remove any stray samples that landed on inflated cells before visualization
+        # --------------------------------------------------------
+        # Post-sampling cleanup and validation
+        # --------------------------------------------------------
+
+        # Remove any free-space samples that landed on inflated obstacles/edges
         self._remove_invalid_free_nodes(graph)
+
         new_points_px = [pt for pt in new_points_px if self._is_free_pixel(pt[0], pt[1])]
-        known_points_px = [pt for pt in known_points_px if self._is_free_pixel(pt[0], pt[1])]
 
-        self._debug_print(f"[DEBUG] Frame offsets: x_off={x_offset:.2f}, y_off={y_offset:.2f}")
-        self._debug_print(f"[DEBUG] Known pts (world→pixel): {len(known_points_px)} visible this frame")
-        self._debug_print(f"[DEBUG] New pts: {len(new_points_px)} total")
+        # --------------------------------------------------------
+        # Ensure local connectivity between inherited and new nodes
+        # --------------------------------------------------------
 
-        boundary_nodes = sum(1 for _, d in graph.nodes(data=True) if d.get("node_type") == "boundary")
-        free_nodes = sum(
-            1
-            for _, d in graph.nodes(data=True)
-            if d.get("node_type") in {"free_space", "known"}
-        )
-        self._debug_print(f"[DEBUG] Node breakdown — boundary: {boundary_nodes}, free-space/known: {free_nodes}")
-
-        # Remove skeleton nodes before running Delaunay
-        skeleton_nodes = [
-            n for n, data in graph.nodes(data=True)
-            if str(data.get("node_type", "")).lower() == "skeleton"
-        ]
-        if skeleton_nodes:
-            graph.remove_nodes_from(skeleton_nodes)
-            self._logger.info(f"Removed {len(skeleton_nodes)} skeleton nodes before Delaunay.")
-
-        # Lightly stitch inherited nodes to newly sampled ones before shortcuts
         self._connect_free_nodes(graph)
 
-        # Drop any samples that landed on inflated obstacles/edges
-        self._remove_invalid_free_nodes(graph)
+        # --------------------------------------------------------
+        # Enforce world/pixel/pos/node_type consistency for all nodes
+        # --------------------------------------------------------
 
-        # Add shortcuts
-        if self._config.use_delaunay_shortcuts:
-
-            for node in list(graph.nodes()):
-                data = graph.nodes[node]
-                if "pixel" not in data:
-                    data["pixel"] = node  # assume (row, col)
-                if "world" not in data:
-                    y, x = node
-                    x_w, y_w = self._pixel_to_world(y, x)
-                    data["world"] = (x_w, y_w)
-
-            self._add_delaunay_shortcuts(graph)
-
-        # Add world coordinates to nodes
-        #graph = self._to_world_coordinates(graph)
-        self._debug_transform_vectors()
-
-        # Modified --- ensures every node has "world"
         for _, data in graph.nodes(data=True):
+
+            # Infer missing pixel/world coordinates
             if "pixel" not in data and "world" in data:
                 x_w, y_w = data["world"]
                 y_p, x_p = self._world_to_pixel(Point(x=x_w, y=y_w, z=0))
@@ -444,7 +236,7 @@ class WaypointGraphGenerator:
                 data["world"] = (x_w, y_w)
 
             if "pos" not in data and "pixel" in data:
-                data["pos"] = data["pixel"]
+                data["pos"] = (float(data["world"][0]), float(data["world"][1]))
             if "node_type" not in data:
                 data["node_type"] = "free_space"
 
@@ -453,28 +245,17 @@ class WaypointGraphGenerator:
         else:
             self._logger.info(f"[INFO] Graph consistency OK: {len(graph.nodes)} nodes.")
 
-        # Modified --- update known points (added here for iterative use)
-        reusable_types = {"free_space", "known"}
-        raw_points = [
-            (float(n["world"][0]), float(n["world"][1]))
-            for _, n in graph.nodes(data=True)
-            if "world" in n and str(n.get("node_type", "")).lower() in reusable_types
-        ]
+        # --------------------------------------------------------
+        # Add geometric shortcuts using Delaunay triangulation
+        # --------------------------------------------------------
 
-        def _downsample(points: list[tuple[float, float]], spacing: float) -> list[tuple[float, float]]:
-            grid: dict[tuple[int, int], tuple[float, float]] = {}
-            for x, y in points:
-                key = (int(math.floor(x / spacing)), int(math.floor(y / spacing)))
-                if key not in grid:
-                    grid[key] = (x, y)
-            if len(grid) < len(points) * 0.9 and spacing < self._config.free_space_sampling_threshold:
-                return _downsample(list(grid.values()), spacing * 1.05)
-            return list(grid.values())
+        if self._config.use_delaunay_shortcuts:
+            self._add_delaunay_shortcuts(graph)
 
-        spacing = self._config.free_space_sampling_threshold * 0.8
-        self._known_points = _downsample(raw_points, spacing)
+        # --------------------------------------------------------
+        # Graph pruning and final graph storage
+        # --------------------------------------------------------
 
-        # Prune unnecessary nodes and edges from the graph
         if self._config.prune_graph:
             self._prune_graph(graph)
 
@@ -482,120 +263,32 @@ class WaypointGraphGenerator:
         self._graph = graph
         self._logger.info(f"Final graph has {len(graph.nodes)} nodes and {len(graph.edges)} unique edges")
 
-        # --- Clean up malformed pixel entries before building nearest node map ---
-        fixed_count = 0
-        removed_count = 0
+        # --------------------------------------------------------
+        # Normalize pixel attributes for all nodes
+        # --------------------------------------------------------
 
         for node, data in self._graph.nodes(data=True):
             pix = data.get("pixel")
             if pix is None:
                 if isinstance(node, tuple) and len(node) == 2:
                     data["pixel"] = node
-                    fixed_count += 1
                 continue
 
             pix_arr = np.array(pix).flatten()
 
-            # Validate shape
             if pix_arr.shape[0] < 2:
-                self._debug_print(f"[WARN] Dropping malformed pixel for node {node}: {pix}")
                 data.pop("pixel", None)
-                removed_count += 1
                 continue
 
-            # Assign clean 2D int tuple
             y, x = map(int, pix_arr[:2])
             data["pixel"] = (y, x)
-            fixed_count += 1
 
-        self._debug_print(f"[DEBUG] Normalized {fixed_count} pixels, removed {removed_count} malformed entries.")
-        # -------------------------------------------------------------------------
+        # --------------------------------------------------------
+        # Build nearest-node acceleration structure
+        # --------------------------------------------------------
 
         self._build_nearest_node_map(self._graph)
         return self._graph
-
-    def project_edges_to_current_frame(self, graph: nx.Graph, inflated_map_shape, x_offset, y_offset, rotation=0.0):
-        """
-        Convert all world-space edges to current local pixel frame for visualization or masking.
-        """
-        edges_px = []
-
-        for n1, n2, data in graph.edges(data=True):
-            w1 = graph.nodes[n1].get("world")
-            w2 = graph.nodes[n2].get("world")
-            if w1 is None or w2 is None:
-                continue
-
-            # Build temporary Point objects from stored world coords
-            p1_world = Point(x=w1[0], y=w1[1], z=0.0)
-            p2_world = Point(x=w2[0], y=w2[1], z=0.0)
-
-            # Temporarily override offsets/rotation for the current local frame
-            prev_off_x, prev_off_y = self._x_offset, self._y_offset
-            prev_cos, prev_sin = self._cos_rot, self._sin_rot
-
-            self._x_offset = x_offset
-            self._y_offset = y_offset
-            self._cos_rot = np.cos(rotation)
-            self._sin_rot = np.sin(rotation)
-
-            try:
-                pix1 = self._world_to_pixel(p1_world)
-                pix2 = self._world_to_pixel(p2_world)
-            finally:
-                # restore transform parameters
-                self._x_offset = prev_off_x
-                self._y_offset = prev_off_y
-                self._cos_rot = prev_cos
-                self._sin_rot = prev_sin
-
-            if pix1 is None or pix2 is None:
-                continue
-
-            row1, col1 = pix1
-            row2, col2 = pix2
-
-            # check bounds
-            h, w = inflated_map_shape
-            if not (0 <= row1 < h and 0 <= col1 < w and 0 <= row2 < h and 0 <= col2 < w):
-                continue
-
-            edges_px.append(((row1, col1), (row2, col2)))
-
-        return edges_px
-
-    def _debug_save_stage(self, name: str, image: np.ndarray, color: bool = False, graph=None):
-        """Save intermediate debug images with consistent naming."""
-        # Only save if debug flag is enabled
-        if not self._config.debug:
-            return
-            
-        import os
-        os.makedirs("debug_stages", exist_ok=True)
-        path = f"debug_stages/{name}.png"# Add shortcuts
-
-        if image is None:
-            self._logger.warning(f"[WARN] No image provided for {name}")
-            return
-
-        # Convert to color if needed for node overlays
-        img = image.copy()
-        if len(img.shape) == 2:
-            img = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
-        else:
-            img = img.copy()
-
-        # Optional: overlay graph nodes if provided
-        if graph is not None:
-            for node in graph.nodes():
-                try:
-                    y, x = map(int, node)
-                    cv2.circle(img, (x, y), 2, (0, 0, 255), -1)
-                except Exception:
-                    continue
-
-        cv2.imwrite(path, img)
-        self._debug_print(f"[DEBUG] Saved {path}")
 
     def _astar_heuristic(self, n1, n2):
         """A* heuristic for the graph."""
@@ -615,7 +308,6 @@ class WaypointGraphGenerator:
             goal_pixel = self._world_to_pixel(goal)
             if not self._check_line_collision(start_pixel, goal_pixel):
                 return [start, goal]
-
         try:
             start_node, goal_node = self.get_node_ids([start, goal])
         except Exception as e:
@@ -647,6 +339,76 @@ class WaypointGraphGenerator:
             self._logger.error(f"No path found for start: {start} and goal: {goal}")
             return []
 
+    def get_node_ids(self, points: list[Point]) -> list[Optional[int]]:
+        """Find the nearest graph node to each query point on the node lookup map."""
+        if self._graph is None:
+            raise RuntimeError("No graph has been built yet")
+
+        if self._node_map is None:
+            self._build_nearest_node_map(self._graph)
+
+        results = []
+        for point in points:
+            y, x = self._world_to_pixel(point)
+            if not self._is_within_bounds(y, x):
+                results.append(None)
+                continue
+            label = self._node_map[y, x]
+            if label < 0:
+                results.append(None)
+            else:
+                results.append(int(label))
+
+        return results
+
+    # ==========================================================
+    # Coordinate transforms & unit conversions
+    # ==========================================================
+
+    def _pixel_to_world(self, row: float, col: float) -> Point:
+        """Convert pixel coordinates to world coordinates with the current transform."""
+        return pixel_to_world(row, col, self._resolution, self._x_offset, self._y_offset, self._cos_rot, self._sin_rot, self._image_shape)
+
+    def _world_to_pixel(self, point: Point) -> tuple[int, int]:
+        """Convert world coordinates to pixel coordinates with the inverse transform."""
+        return world_to_pixel(point, self._resolution, self._x_offset, self._y_offset, self._cos_rot, self._sin_rot, self._image_shape)
+
+    def _point_to_tuple(self, value) -> tuple[float, float, float]:
+        """Normalize Point-like inputs to an (x, y, z) tuple."""
+        if hasattr(value, "x") and hasattr(value, "y"):
+            x = float(value.x)
+            y = float(value.y)
+            z = float(getattr(value, "z", 0.0))
+            return (x, y, z)
+        if isinstance(value, (tuple, list, np.ndarray)) and len(value) >= 2:
+            x = float(value[0])
+            y = float(value[1])
+            z = float(value[2]) if len(value) >= 3 else 0.0
+            return (x, y, z)
+        return (0.0, 0.0, 0.0)
+
+    def _to_pixels(self, meters: float) -> float:
+        """Convert a distance from meters to pixels."""
+        if self._resolution is None:
+            raise ValueError("Resolution not set. Call build_graph_from_grid_map first.")
+        return meters / self._resolution
+
+    def _to_pixels_int(self, meters: float) -> int:
+        """Convert a distance from meters to pixels and round to integer."""
+        return int(self._to_pixels(meters))
+
+    # ==========================================================
+    # Map preprocessing
+    # ==========================================================
+
+    def _free_mask_from_map(self, occupancy: np.ndarray) -> np.ndarray:
+        """Return binary mask of free space (1 = free)."""
+        if occupancy is None:
+            raise RuntimeError("Occupancy map is not initialized.")
+        if occupancy.max() <= 1:
+            return (occupancy == 0).astype(np.uint8)
+        return (occupancy > self._occupancy_threshold).astype(np.uint8)
+
     def _distance_transform(self, free_map: np.ndarray):
         """Inflate obstacles in the occupancy grid using a distance transform."""
         # Pad the binary map by 1 pixel on all sides to avoid nodes being created on the edges of the map
@@ -659,7 +421,7 @@ class WaypointGraphGenerator:
         self._inflated_map = self._inflated_map[1:-1, 1:-1]
 
     def _distance_transform_cuda(self, free_map: np.ndarray):
-        
+        """Inflate obstacles in the occupancy grid using a GPU-accelerated distance transform (if cupy is available). Currently unused."""
         try:
             import cupy as cp
             from cupyx.scipy.ndimage import distance_transform_edt
@@ -667,7 +429,6 @@ class WaypointGraphGenerator:
         except Exception:
             use_gpu = False
 
-        
         free_map_padded = np.pad(
             free_map,
             ((1, 1), (1, 1)),
@@ -675,14 +436,13 @@ class WaypointGraphGenerator:
             constant_values=0,
         )
 
-        
         if use_gpu:
             free_gpu = cp.asarray(free_map_padded.astype(np.uint8))
 
             # CUDA Euclidean Distance Transform
             dist_gpu = distance_transform_edt(free_gpu)
 
-            # STORE dist transform (for legacy users)
+            # Store dist transform (for legacy users)
             self._dist_transform = cp.asnumpy(dist_gpu)
 
             safety_px = float(self._safety_distance) / float(self._resolution)
@@ -691,7 +451,6 @@ class WaypointGraphGenerator:
 
             self._inflated_map = cp.asnumpy(inflated_gpu[1:-1, 1:-1])
 
-        
         else:
             self._logger.warning(
                 "[WARN] CuPy not available — falling back to CPU distance transform."
@@ -709,7 +468,28 @@ class WaypointGraphGenerator:
 
             self._inflated_map = self._inflated_map[1:-1, 1:-1]
 
+    def _is_free_pixel(self, row: int, col: int) -> bool:
+        """Check whether a pixel lies within map bounds and is free of inflated obstacles."""
+        if self._inflated_map is None:
+            return True
+        h, w = self._inflated_map.shape
+        if not (0 <= row < h and 0 <= col < w):
+            return False
+        return self._inflated_map[row, col] == 0
 
+    def _is_within_bounds(self, row: int, col: int) -> bool:
+        """Check if a point is within the bounds of the map."""
+        if self._inflated_map is None:
+            return False
+        return 0 <= row < self._inflated_map.shape[0] and 0 <= col < self._inflated_map.shape[1]
+
+    def _is_valid_point(self, row: int, col: int) -> bool:
+        """Check if a point is within bounds and in free space."""
+        return self._is_within_bounds(row, col) and not self._inflated_map[row, col]
+
+    # ==========================================================
+    # Graph construction primitives
+    # ==========================================================
 
     def _create_grid_graph(self, shape: tuple[int, int], grid_sample_distance: int) -> nx.Graph:
         """Create a grid graph for completely free maps with a margin from the borders."""
@@ -726,12 +506,6 @@ class WaypointGraphGenerator:
                 f" {self._safety_distance}, resolution: {self._resolution})"
             )
 
-        # Ensure minimum step size of 1 pixel
-        # Choose step size for grid:
-        # - Minimum of 1 pixel to ensure we can always create a grid
-        # - Maximum of `free_space_sampling_threshold` pixels to avoid too sparse sampling in large maps
-        # - For medium maps, use half the smallest map dimension (after margins)
-        #   to create a reasonable number of waypoints
         step = max(1, min(grid_sample_distance, min(height - 2 * margin, width - 2 * margin) // 2))
         graph = nx.Graph()
 
@@ -758,13 +532,6 @@ class WaypointGraphGenerator:
         Takes a NetworkX graph with nodes in pixel coordinates (y,x) and converts them to world coordinates (x,y,z)
         using the current transform parameters (resolution, offset, rotation). Edge weights are scaled by resolution
         to convert from pixels to meters.
-
-        Args:
-            graph: NetworkX graph with nodes in pixel coordinates (y,x)
-
-        Returns:
-            NetworkX graph with nodes converted to world coordinates (x,y,z) tuples, preserving all attributes.
-            Original pixel coordinates are stored in node attribute 'pixel'.
         """
         world_graph = nx.Graph()
         pixel_to_id_lookup = {}
@@ -799,73 +566,202 @@ class WaypointGraphGenerator:
 
         return world_graph
 
-    def _build_graph_from_skeleton(self, skeleton_sample_distance: int) -> np.ndarray:
-        """Generate a graph from the skeleton of the inflated map."""
-        self._logger.info("Generating skeleton...")
-        try:
-            skeleton_image = thin((1 - inflated_map).view(cp.uint8))
-        except RuntimeError as e:
-            from skimage.morphology import skeletonize
+    def _sample_obstacle_boundaries(self, graph: nx.Graph, sample_distance: float = 50) -> list[tuple[int, int]]:
+        """Sample nodes along obstacle boundaries."""
+        # Find contours of inflated obstacles
+        contours = self._find_obstacle_contours(
+            self._config.boundary_inflation_factor * self._safety_distance / self._resolution
+        )
 
-            self._logger.warning(f"Failed to generate skeleton with cucim: {e}. Falling back to skimage.")
-            skeleton_image = skeletonize(1 - inflated_map)
+        initial_num_nodes = len(graph.nodes())
 
-        if skeleton_image.sum() == 0:
-            self._logger.warning("No skeleton found in map")
-            return nx.Graph()
+        # Process each contour
+        for contour in contours:
+            contour_nodes = []
 
-        self._logger.info("Building graph from skeleton...")
-        # Convert to numpy if it's a cupy array, otherwise use as-is
-        if hasattr(skeleton_image, "get"):  # cupy array
-            skeleton_image_np = skeleton_image.get()
-        else:  # numpy array
-            skeleton_image_np = skeleton_image
-        skeleton = skan.Skeleton(skeleton_image_np)
-        graph = nx.Graph()
+            # Process each vertex in the contour
+            for i in range(len(contour)):
+                p1 = contour[i][0]
+                p2 = contour[(i + 1) % len(contour)][0]  # Wrap around to first point
 
-        for i in range(skeleton.n_paths):
-            branch = skeleton.path_coordinates(i)
-            # Count the number of segments in the branch
-            num_segments = max(1, len(branch) // skeleton_sample_distance)
-            segment_length = len(branch) // num_segments
-            for j in range(num_segments):
-                start = branch[j * segment_length]
-                end = branch[min((j + 1) * segment_length, len(branch) - 1)]
-                if self._check_line_collision(start, end):
+                # Convert first point to y,x format
+                row_1, col_1 = int(p1[1]), int(p1[0])
+                contour_nodes.append((row_1, col_1))
+                graph.add_node(
+                    (row_1, col_1),
+                    node_type="boundary",
+                    pixel=(row_1, col_1),
+                    world=self._pixel_to_world(row_1, col_1),
+                )
+
+                # Calculate distance to next vertex
+                segment_length = np.linalg.norm(p2 - p1)
+                # Add intermediate points
+                num_intermediate = int(segment_length / sample_distance)
+                # Skip first and last points
+                intermediate_points = np.linspace(p1, p2, num=num_intermediate, endpoint=False).astype(int).tolist()[1:]
+                for point in intermediate_points:
+                    # Interpolate point
+                    col, row = point
+                    contour_nodes.append((row, col))
+                    graph.add_node(
+                        (row, col),
+                        node_type="boundary",
+                        pixel=(row, col),
+                        world=self._pixel_to_world(row, col),
+                    )
+
+            # Connect consecutive nodes along this contour
+            if len(contour_nodes) > 1:
+                self._connect_contour_nodes(contour_nodes, graph)
+
+        num_nodes_added = len(graph.nodes()) - initial_num_nodes
+        self._logger.info(f"Added {num_nodes_added} nodes along obstacle boundaries")
+
+    def _find_obstacle_contours(self, boundary_inflation: float) -> list[np.ndarray]:
+        """Find contours of inflated obstacles using the distance map."""
+        filtered_obstacles = (self._dist_transform >= boundary_inflation).astype(np.uint8)
+        contours, _ = cv2.findContours(filtered_obstacles, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
+        return contours
+
+    def _connect_contour_nodes(self, contour_nodes: list[tuple[int, int]], graph: nx.Graph):
+        """Connect consecutive nodes along the contour."""
+        for i in range(len(contour_nodes)):
+            n1 = contour_nodes[i]
+            n2 = contour_nodes[(i + 1) % len(contour_nodes)]
+
+            if not self._check_line_collision(n1, n2):
+                dist = np.sqrt((n1[0] - n2[0]) ** 2 + (n1[1] - n2[1]) ** 2)
+                graph.add_edge(n1, n2, weight=dist, edge_type="contour")
+
+    # ==========================================================
+    # Free-space sampling
+    # ==========================================================
+
+    def _sample_free_space(self, graph, distance_threshold: float):
+        """Iteratively sample free space in a map by identifying and adding nodes at local maxima
+        of large distance areas until no such areas remain.
+        """
+        new_points: list[tuple[int, int]] = []
+        base_map = self._inflated_map if self._inflated_map is not None else self._original_map
+        free_mask = self._free_mask_from_map(base_map)
+
+        H, W = free_mask.shape
+        blocked_mask = free_mask.copy()
+        kernel = np.ones((3, 3), np.uint8)
+
+        max_iters = 12      # Hard stop to avoid runaway loops
+        stall_limit = 2     # Stop if we fail to add nodes for these many iterations
+
+        def _node_pixel(node, data):
+            pixel = data.get("pixel")
+            if pixel is None and isinstance(node, tuple) and len(node) == 2:
+                pixel = node
+            if pixel is None:
+                return None
+            row, col = int(pixel[0]), int(pixel[1])
+            if 0 <= row < H and 0 <= col < W:
+                return row, col
+            return None
+
+        idx = index.Index()
+        idx_counter = 0
+
+        def _add_to_index(row: int, col: int):
+            nonlocal idx_counter
+            idx.insert(idx_counter, (col, row, col, row))
+            idx_counter += 1
+
+        for node, data in graph.nodes(data=True):
+            pix = _node_pixel(node, data)
+            if pix is None:
+                continue
+            row, col = pix
+            blocked_mask[row, col] = 0
+            _add_to_index(row, col)
+
+        iterations = 0
+        stall_iters = 0
+        prev_max_distance: float | None = None
+
+        while True:
+            iterations += 1
+
+            # Distance transform + maxima detection
+            distance_map = cv2.distanceTransform(blocked_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+            max_distance = float(distance_map.max())
+            large_distance_areas = distance_map > distance_threshold
+            if not np.any(large_distance_areas):
+                break
+            dilated = cv2.dilate(distance_map, kernel)
+            local_maxima_mask = (distance_map == dilated) & large_distance_areas
+            local_maxima_coords = np.column_stack(np.where(local_maxima_mask))
+
+            # Early convergence checks
+            if max_distance <= distance_threshold:
+                break
+            if iterations >= max_iters:
+                self._logger.warning(f"[WARN] Reached max iters ({max_iters}) in free-space sampler; stopping early.")
+                break
+            if prev_max_distance is not None and abs(max_distance - prev_max_distance) < 1e-3:
+                self._logger.info("[INFO] Free-space sampler stalled (max distance plateau); stopping early.")
+                break
+
+            added = False
+            half_threshold = distance_threshold / 2.0
+
+            # Evaluate maxima with spacing constraints
+            for row, col in local_maxima_coords:
+                if blocked_mask[row, col] == 0:
                     continue
-                dist = np.linalg.norm(end - start)
-                graph.add_edge((start[0], start[1]), (end[0], end[1]), weight=dist, edge_type="skeleton")
-        self._logger.info(f"Created skeleton graph with {len(graph.nodes)} nodes and {len(graph.edges)} edges")
 
-        for node in graph.nodes():
-            data = graph.nodes[node]
-            data["node_type"] = "skeleton"
-            if isinstance(node, tuple) and len(node) == 2:
-                data.setdefault("pixel", (int(node[0]), int(node[1])))
-            if "pixel" in data:
-                row, col = data["pixel"]
-                data["world"] = self._pixel_to_world(row, col)
+                # Reject if too close to an existing sample
+                bounding_box = (
+                    max(0, col - half_threshold),
+                    max(0, row - half_threshold),
+                    min(W - 1, col + half_threshold),
+                    min(H - 1, row + half_threshold),
+                )
+                if list(idx.intersection(bounding_box)):
+                    continue
 
-        return graph
+                graph.add_node(
+                    (row, col),
+                    node_type="free_space",
+                    pixel=(row, col),
+                    world=self._pixel_to_world(row, col),
+                )
+                new_points.append((row, col))
+                blocked_mask[row, col] = 0  # mark as occupied for next iteration
+                _add_to_index(row, col)
+                added = True
+
+            # Convergence/stall guard
+            if not added:
+                stall_iters += 1
+            else:
+                stall_iters = 0
+            if stall_iters >= stall_limit:
+                break
+
+            prev_max_distance = max_distance
+
+        return new_points
+
+    # ==========================================================
+    # Graph topology refinement
+    # ==========================================================
 
     def _check_line_collision(self, p0, p1):
-        """
-        Check if the line between two points intersects with any obstacles.
+        """Check if the line between two points intersects with any obstacles."""
+        if self._inflated_map is None:
+            return False
 
-        Args:
-            p0: Coordinates of the start point (y, x)
-            p1: Coordinates of the end point (y, x)
-
-        Returns:
-            True if there is a collision, False otherwise
-        """
-
-        # --- NEW: handle world-coordinate inputs ---
+        # Handles world-coordinate inputs
         def ensure_pixel(pt):
-            # If already pixel-like (ints), keep them
             if all(isinstance(v, (int, np.integer)) for v in pt):
                 return pt
-            # Otherwise convert from world → pixel
+            # Converts from world to pixel
             if isinstance(pt, np.ndarray):
                 x, y = pt
             else:
@@ -877,7 +773,6 @@ class WaypointGraphGenerator:
         p1_px = ensure_pixel(p1)
         y0, x0 = p0_px
         y1, x1 = p1_px
-        # --- rest of your collision logic below ---
 
         # Bresenham's line algorithm to get the pixels the line passes through
         #y0, x0 = p0
@@ -901,239 +796,7 @@ class WaypointGraphGenerator:
                 err += dx
                 y0 += sy
 
-        return False  # No collision detected
-
-    def _free_mask_from_map(self, occupancy: np.ndarray) -> np.ndarray:
-        """Return binary mask of free space (1 = free)."""
-        if occupancy is None:
-            raise RuntimeError("Occupancy map is not initialized.")
-        if occupancy.max() <= 1:
-            return (occupancy == 0).astype(np.uint8)
-        return (occupancy > self._occupancy_threshold).astype(np.uint8)
-
-    def _is_free_pixel(self, row: int, col: int) -> bool:
-        if self._inflated_map is None:
-            return True
-        h, w = self._inflated_map.shape
-        if not (0 <= row < h and 0 <= col < w):
-            return False
-        return self._inflated_map[row, col] == 0
-
-    def _sample_free_space(self, graph, distance_threshold: float):
-        """
-        Iteratively sample free space in a map by identifying and adding nodes at local maxima
-        of large distance areas until no such areas remain.
-
-        Args:
-            graph: The graph to which new nodes will be added.
-            distance_threshold: The threshold to identify areas with large distances.
-        """
-        new_points = []
-        base_map = self._inflated_map if self._inflated_map is not None else self._original_map
-        free_mask = self._free_mask_from_map(base_map)
-
-        distance_map = np.full(free_mask.shape, np.inf, dtype=np.float64)
-        distance_map[free_mask == 0] = 0
-
-        def _node_pixel(node, data):
-            pixel = data.get("pixel")
-            if pixel is None and isinstance(node, tuple) and len(node) == 2:
-                pixel = node
-            if pixel is None:
-                return None
-            row, col = int(pixel[0]), int(pixel[1])
-            if 0 <= row < distance_map.shape[0] and 0 <= col < distance_map.shape[1]:
-                return row, col
-            return None
-
-        for node, data in graph.nodes(data=True):
-            if str(data.get("node_type", "")).lower() == "skeleton":
-                continue
-            pix = _node_pixel(node, data)
-            if pix is not None:
-                distance_map[pix[0], pix[1]] = 0
-
-        # Initialize kernel for dilation
-        kernel = np.ones((3, 3), np.uint8)
-
-        while True:
-            # Use distance transform to calculate distances to the nearest node
-            distance_map = cv2.distanceTransform(
-                (distance_map > 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
-            )
-
-            # --- DEBUG INSERTION ---
-            if self._config.debug:
-                self.last_distance_map = distance_map.copy()
-                cv2.imwrite(
-                    "debug_distance_map_free_space.png",
-                    cv2.normalize(distance_map, None, 0, 255, cv2.NORM_MINMAX),
-                )
-                self._debug_print("[DEBUG free_space] distance_map max (px):", float(distance_map.max()))
-            # -----------------------
-
-            # Identify large distance areas
-            large_distance_areas = (distance_map > distance_threshold).astype(np.uint8)
-
-            if not np.any(large_distance_areas):
-                break
-
-            # Dilate the large distance areas
-            dilated = cv2.dilate(distance_map, kernel)
-
-            # Find local maxima
-            local_maxima_mask = (distance_map == dilated) & (large_distance_areas > 0)
-            local_maxima_coords = np.column_stack(np.where(local_maxima_mask))
-            self._debug_print(f"[DEBUG sampler] found {len(local_maxima_coords)} local maxima")
-
-            idx = index.Index()
-            idx_counter = 0
-            for node, data in graph.nodes(data=True):
-                if str(data.get("node_type", "")).lower() == "skeleton":
-                    continue
-                pix = _node_pixel(node, data)
-                if pix is None:
-                    continue
-                row, col = pix
-                idx.insert(idx_counter, (col, row, col, row))
-                idx_counter += 1
-
-            added = False
-            for row, col in local_maxima_coords:
-                if free_mask[row, col] == 0:
-                    continue
-                half_threshold = distance_threshold / 2
-                bounding_box = (col - half_threshold, row - half_threshold, col + half_threshold, row + half_threshold)
-                if list(idx.intersection(bounding_box)):
-                    continue
-                graph.add_node((row, col), node_type="free_space", pixel=(row, col), world=self._pixel_to_world(row, col))
-                idx.insert(idx_counter, (col, row, col, row))
-                idx_counter += 1
-                distance_map[row, col] = 0
-                new_points.append((row, col))
-                added = True
-
-            self._debug_print(f"[DEBUG sampler] distance_map max: {distance_map.max():.2f}, threshold(px): {distance_threshold}")
-
-            if not added:
-                break
-
-        return new_points
-
-    # Moddified --- added a section to account for known points
-    def _sample_free_space_incremental(self, graph, known_points, distance_threshold):
-        """
-        Incrementally sample free-space areas by treating known points as existing samples,
-        not as obstacles. This mirrors _sample_free_space() exactly, except it seeds the
-        distance map with known points.
-        """
- 
-        # --- Safety mask of free space ---
-        if not hasattr(self, "_safe_mask") or self._safe_mask is None:
-            self._safe_mask = (self._original_map > self._occupancy_threshold).astype(np.uint8)
-        safe_mask = self._safe_mask
-        H, W = safe_mask.shape    
-        free_mask = safe_mask.copy()
-
-        distance_map = np.full((H, W), np.inf, dtype=np.float64)
-        distance_map[free_mask == 0] = 0
-
-        def _node_pixel(node, data):
-            pixel = data.get("pixel")
-            if pixel is None and isinstance(node, tuple) and len(node) == 2:
-                pixel = node
-            if pixel is None:
-                return None
-            row, col = int(pixel[0]), int(pixel[1])
-            if 0 <= row < H and 0 <= col < W:
-                return row, col
-            return None
-
-        known_pixels = []
-        for (x, y) in known_points:
-            pix = self._world_to_pixel(Point(x=x, y=y, z=0.0))
-            if pix is None:
-                continue
-            row, col = pix
-            if 0 <= row < H and 0 <= col < W and free_mask[row, col] == 1:
-                known_pixels.append((row, col))
-                distance_map[row, col] = 0
-
-        for node, data in graph.nodes(data=True):
-            if str(data.get("node_type", "")).lower() == "skeleton":
-                continue
-            pix = _node_pixel(node, data)
-            if pix is not None:
-                distance_map[pix[0], pix[1]] = 0
-
-        kernel = np.ones((3, 3), np.uint8)
-        new_points = []
-
-        while True:
-            mask = free_mask.copy()
-            for row, col in known_pixels:
-                mask[row, col] = 0
-            for node, data in graph.nodes(data=True):
-                if str(data.get("node_type", "")).lower() == "skeleton":
-                    continue
-                pix = _node_pixel(node, data)
-                if pix is not None:
-                    mask[pix[0], pix[1]] = 0
-
-            distance_map = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-
-            large_distance_areas = (distance_map > distance_threshold).astype(np.uint8)
-            if not np.any(large_distance_areas):
-                self._logger.info("[INFO] No new free-space regions above threshold.")
-                break
-
-            dilated = cv2.dilate(distance_map, kernel)
-            local_maxima_mask = (distance_map == dilated) & (large_distance_areas > 0)
-            local_maxima_coords = np.column_stack(np.where(local_maxima_mask))
-
-            idx = index.Index()
-            idx_counter = 0
-            for node, data in graph.nodes(data=True):
-                if str(data.get("node_type", "")).lower() == "skeleton":
-                    continue
-                pix = _node_pixel(node, data)
-                if pix is None:
-                    continue
-                row, col = pix
-                idx.insert(idx_counter, (col, row, col, row))
-                idx_counter += 1
-
-            added = False
-            for row, col in local_maxima_coords:
-                if free_mask[row, col] == 0:
-                    continue
-
-                half_threshold = distance_threshold / 2
-                bounding_box = (col - half_threshold, row - half_threshold, col + half_threshold, row + half_threshold)
-                if list(idx.intersection(bounding_box)):
-                    continue
-
-                graph.add_node((row, col), pixel=(row, col), node_type="free_space", world=self._pixel_to_world(row, col))
-                idx.insert(idx_counter, (col, row, col, row))
-                idx_counter += 1
-                new_points.append((row, col))
-                distance_map[row, col] = 0
-                added = True
-
-            if not added:
-                break
-
-        return new_points
-
-    def _remove_skeleton_nodes(self, graph: nx.Graph) -> None:
-        """Remove skeleton nodes so they do not affect downstream shortcuts."""
-        nodes_to_remove = [
-            n for n, data in graph.nodes(data=True)
-            if str(data.get("node_type", "")).lower() == "skeleton"
-        ]
-        if nodes_to_remove:
-            graph.remove_nodes_from(nodes_to_remove)
-            self._logger.info(f"Removed {len(nodes_to_remove)} skeleton nodes before Delaunay.")
+        return False
 
     def _connect_free_nodes(self, graph: nx.Graph) -> None:
         """Connect nearby free-space/boundary nodes to reduce seams."""
@@ -1142,7 +805,7 @@ class WaypointGraphGenerator:
 
         for node, data in graph.nodes(data=True):
             node_type = str(data.get("node_type", "")).lower()
-            if node_type not in {"free_space", "boundary", "known"}:
+            if node_type not in {"free_space", "boundary"}:
                 continue
 
             world = data.get("world")
@@ -1186,41 +849,12 @@ class WaypointGraphGenerator:
                 if current is not None and current <= dist:
                     continue
                 existing["weight"] = dist
-                existing["edge_type"] = existing.get("edge_type", "known")
+                existing["edge_type"] = existing.get("edge_type", "free_space")
             else:
-                graph.add_edge(n1, n2, weight=dist, edge_type="known")
-
-    def _remove_invalid_free_nodes(self, graph: nx.Graph) -> None:
-        if self._inflated_map is None:
-            return
-
-        height, width = self._inflated_map.shape
-        to_remove: list = []
-        for node, data in graph.nodes(data=True):
-            node_type = str(data.get("node_type", "")).lower()
-            if node_type not in {"free_space", "known"}:
-                continue
-
-            pix = data.get("pixel")
-            if pix is None:
-                continue
-            row, col = int(pix[0]), int(pix[1])
-            if not (0 <= row < height and 0 <= col < width):
-                to_remove.append(node)
-                continue
-            if self._inflated_map[row, col] != 0:
-                to_remove.append(node)
-
-        if to_remove:
-            graph.remove_nodes_from(to_remove)
+                graph.add_edge(n1, n2, weight=dist, edge_type="free_space")
 
     def _add_delaunay_shortcuts(self, graph: nx.Graph):
-        """
-        Create shortcuts based on Delaunay triangulation of nodes.
-
-        Args:
-            graph: NetworkX graph to add shortcuts to
-        """
+        """Create shortcuts based on Delaunay triangulation of nodes."""
 
         self._logger.info("Adding Delaunay shortcuts (world-frame)...")
 
@@ -1307,92 +941,30 @@ class WaypointGraphGenerator:
 
         self._logger.info(f"[INFO] Delaunay shortcuts added: {added}")
 
+    def _remove_invalid_free_nodes(self, graph: nx.Graph) -> None:
+        """Remove free-space nodes that are invalid under the inflated obstacle map."""
+        if self._inflated_map is None:
+            return
 
-    def _sample_obstacle_boundaries(self, graph: nx.Graph, sample_distance: float = 50) -> list[tuple[int, int]]:
-        """
-        Sample nodes along obstacle boundaries.
+        height, width = self._inflated_map.shape
+        to_remove: list = []
+        for node, data in graph.nodes(data=True):
+            node_type = str(data.get("node_type", "")).lower()
+            if node_type not in {"free_space"}:
+                continue
 
-        Args:
-            graph: Existing graph
-            sample_distance: Distance between samples along contour (in pixels).
-                           Defaults to 50 (pixels).
-        """
+            pix = data.get("pixel")
+            if pix is None:
+                continue
+            row, col = int(pix[0]), int(pix[1])
+            if not (0 <= row < height and 0 <= col < width):
+                to_remove.append(node)
+                continue
+            if self._inflated_map[row, col] != 0:
+                to_remove.append(node)
 
-        # Find contours of inflated obstacles
-        contours = self._find_obstacle_contours(
-            self._config.boundary_inflation_factor * self._safety_distance / self._resolution
-        )
-
-        initial_num_nodes = len(graph.nodes())
-        
-        # Process each contour
-        for contour in contours:
-            contour_nodes = []
-
-            # Process each vertex in the contour
-            for i in range(len(contour)):
-                p1 = contour[i][0]
-                p2 = contour[(i + 1) % len(contour)][0]  # Wrap around to first point
-
-                # Convert first point to y,x format
-                row_1, col_1 = int(p1[1]), int(p1[0])
-                contour_nodes.append((row_1, col_1))
-                graph.add_node(
-                    (row_1, col_1),
-                    node_type="boundary",
-                    pixel=(row_1, col_1),
-                    world=self._pixel_to_world(row_1, col_1),
-                )
-
-                # Calculate distance to next vertex
-                segment_length = np.linalg.norm(p2 - p1)
-                # Add intermediate points
-                num_intermediate = int(segment_length / sample_distance)
-                # Skip first and last points
-                intermediate_points = np.linspace(p1, p2, num=num_intermediate, endpoint=False).astype(int).tolist()[1:]
-                for point in intermediate_points:
-                    # Interpolate point
-                    col, row = point
-                    contour_nodes.append((row, col))
-                    graph.add_node(
-                        (row, col),
-                        node_type="boundary",
-                        pixel=(row, col),
-                        world=self._pixel_to_world(row, col),
-                    )
-
-            # Connect consecutive nodes along this contour
-            if len(contour_nodes) > 1:
-                self._connect_contour_nodes(contour_nodes, graph)
-
-        num_nodes_added = len(graph.nodes()) - initial_num_nodes
-        self._logger.info(f"Added {num_nodes_added} nodes along obstacle boundaries")
-
-    def _find_obstacle_contours(self, boundary_inflation: float) -> list[np.ndarray]:
-        """Find contours of inflated obstacles using the distance map."""
-
-        filtered_obstacles = (self._dist_transform >= boundary_inflation).astype(np.uint8)
-        contours, _ = cv2.findContours(filtered_obstacles, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
-        self._debug_print(f"[DEBUG] Found {len(contours)} contours from distance transform.")
-        return contours
-
-    def _is_within_bounds(self, row: int, col: int) -> bool:
-        """Check if a point is within the bounds of the map."""
-        return 0 <= row < self._inflated_map.shape[0] and 0 <= col < self._inflated_map.shape[1]
-
-    def _is_valid_point(self, row: int, col: int) -> bool:
-        """Check if a point is within bounds and in free space."""
-        return self._is_within_bounds(row, col) and not self._inflated_map[row, col]
-
-    def _connect_contour_nodes(self, contour_nodes: list[tuple[int, int]], graph: nx.Graph):
-        """Connect consecutive nodes along the contour."""
-        for i in range(len(contour_nodes)):
-            n1 = contour_nodes[i]
-            n2 = contour_nodes[(i + 1) % len(contour_nodes)]
-
-            if not self._check_line_collision(n1, n2):
-                dist = np.sqrt((n1[0] - n2[0]) ** 2 + (n1[1] - n2[1]) ** 2)
-                graph.add_edge(n1, n2, weight=dist, edge_type="contour")
+        if to_remove:
+            graph.remove_nodes_from(to_remove)
 
     def _prune_graph(self, graph: nx.Graph):
         """Remove isolated nodes, small subgraphs, and merge close nodes."""
@@ -1410,269 +982,90 @@ class WaypointGraphGenerator:
         for component in components:
             subgraph = graph.subgraph(component)
             total_length = sum(d["weight"] for _, _, d in subgraph.edges(data=True))
-            if total_length < self._to_pixels_int(self._config.min_subgraph_length):
+            if total_length < self._config.min_subgraph_length:
                 graph.remove_nodes_from(component)
 
     def _merge_close_nodes(self, graph: nx.Graph, threshold: float):
         """Merge nodes that are within a certain distance threshold (meters)."""
 
-        # --- SAFETY PATCH: ensure all nodes have 'pos' defined ---
-        for node, data in graph.nodes(data=True):
-            if "world" in data and isinstance(data["world"], (tuple, list)) and len(data["world"]) == 2:
-                data["pos"] = np.array(data["world"], dtype=float)
-            elif "pixel" in data and isinstance(data["pixel"], (tuple, list)) and len(data["pixel"]) == 2:
-                # convert pixel → world explicitly
-                y, x = data["pixel"]
-                x_w, y_w = self._pixel_to_world(y, x)
-                data["pos"] = np.array((x_w, y_w), dtype=float)
-            else:
-                # fallback to node key itself
-                data["pos"] = np.array(node, dtype=float)
-        # ----------------------------------------------------------
-
         while True:
-            nodes = list(graph.nodes())
+            # Collect positions of nodes
+            node_positions = []
+            node_ids = []
 
-            # Modified - debug before node_coords
-            self._debug_print("[DEBUG] Checking node positions before merging...")
-            for i, n in enumerate(graph.nodes):
-                pos = graph.nodes[n].get("pos", None)
-                #print(f"{i:03d} {n}: {pos}")
-            self._debug_print("[DEBUG] Total nodes:", len(graph.nodes))
-            self._debug_print("[DEBUG] Threshold:", threshold)
-
-            node_coords = [data["pos"] for _, data in graph.nodes(data=True) if "pos" in data]
-
-            self._debug_print("[DEBUG] Building KDTree with node_coords:")
-            self._debug_print(f"  Number of coords: {len(node_coords)}")
-
-            bad_entries = []
-            for i, coord in enumerate(node_coords):
-                if not isinstance(coord, (list, tuple)) or len(coord) != 2:
-                    bad_entries.append((i, coord))
+            for n, data in graph.nodes(data=True):
+                pos = data.get("pos")
+                if pos is None:
                     continue
-            # ensure they are numeric
-                try:
-                    float(coord[0])
-                    float(coord[1])
-                except Exception as e:
-                    bad_entries.append((i, coord))
 
-            if bad_entries:
-                self._debug_print("[ERROR] Found malformed coordinates:")
-                for idx, bad in bad_entries:
-                    #print(f"  Index {idx}: {bad} (type: {type(bad)})")
-                    continue
-            else:
-                self._debug_print("[DEBUG] All coords look valid. Example few:", node_coords[:5])
+                node_positions.append((pos[0], pos[1]))
+                node_ids.append(n)
 
-            #node_coords = np.array(nodes)
-            node_coords = np.array([[float(x), float(y)] for x, y in node_coords], dtype=float)
-            self._debug_print(f"[DEBUG] node_coords.shape after conversion: {node_coords.shape}, dtype: {node_coords.dtype}")
+            if len(node_positions) < 2:
+                break
 
-            tree = cKDTree(node_coords)
+            node_coords = np.asarray(node_positions, dtype=float)
 
-            # Find pairs of nodes that are close to each other
+            try:
+                tree = cKDTree(node_coords)
+            except Exception:
+                break
+
             pairs = tree.query_pairs(r=threshold)
 
             if not pairs:
-                break  # Exit loop if no pairs are found
+                break
 
-            merged = False  # Track if any merge happened in this iteration
+            merged = False
 
-            for n1_idx, n2_idx in pairs:
-                n1 = nodes[n1_idx]
-                n2 = nodes[n2_idx]
+            # Merging pass
+            for i, j in pairs:
+                n1 = node_ids[i]
+                n2 = node_ids[j]
 
-                # Skip if n2 has already been removed
                 if not graph.has_node(n1) or not graph.has_node(n2):
                     continue
 
-                # Coordinates of n1 and n2
-                n1_pos = graph.nodes[n1]["pos"]
-                n2_pos = graph.nodes[n2]["pos"]
+                n1_pos = graph.nodes[n1].get("pos")
+                n2_pos = graph.nodes[n2].get("pos")
+                if n1_pos is None or n2_pos is None:
+                    continue
 
-                # Merge n2 into n1 and update edges
-                # Check if all n2's neighbors can connect to n1 without collision
-                neighbors = [n for n in graph.neighbors(n2) if n != n1 and graph.has_node(n)]
-                if neighbors:
-                    collision = False
-                    for neighbor in neighbors:
-                        neighbor_pos = graph.nodes[neighbor]["pos"]
-                        if self._check_line_collision(n1_pos, neighbor_pos):
-                            collision = True
-                            break
+                neighbors = [
+                    n for n in graph.neighbors(n2)
+                    if n != n1 and graph.has_node(n)
+                ]
 
-                    if not collision:
-                        for neighbor in neighbors:
-                            neighbor_pos = graph.nodes[neighbor]["pos"]
-                            dist = np.linalg.norm(np.array(neighbor_pos) - np.array(n1_pos))
-                            graph.add_edge(n1, neighbor, weight=dist, edge_type="merge")
-                        graph.remove_node(n2)
-                        merged = True
-                else:
-                    # No neighbors to check, safe to remove
-                    graph.remove_node(n2)
-                    merged = True  # A merge occurred
+                collision = False
+                for neighbor in neighbors:
+                    neighbor_pos = graph.nodes[neighbor].get("pos")
+                    if neighbor_pos is None:
+                        continue
+                    if self._check_line_collision(n1_pos, neighbor_pos):
+                        collision = True
+                        break
+
+                if collision:
+                    continue
+
+                for neighbor in neighbors:
+                    neighbor_pos = graph.nodes[neighbor].get("pos")
+                    if neighbor_pos is None:
+                        continue
+                    dist = np.linalg.norm(
+                        np.asarray(neighbor_pos) - np.asarray(n1_pos)
+                    )
+                    graph.add_edge(n1, neighbor, weight=dist, edge_type="merge")
+
+                graph.remove_node(n2)
+                merged = True
 
             if not merged:
-                break  # Exit loop if no merges occurred in this iteration
+                break
 
-    def _pixel_to_world(self, row: float, col: float) -> Point:
-        """Convert pixel coordinates to world coordinates with the current transform."""
-        return pixel_to_world(row, col, self._resolution, self._x_offset, self._y_offset, self._cos_rot, self._sin_rot, self._image_shape)
-
-    def _world_to_pixel(self, point: Point) -> tuple[int, int]:
-        """Convert world coordinates to pixel coordinates with the inverse transform."""
-        return world_to_pixel(point, self._resolution, self._x_offset, self._y_offset, self._cos_rot, self._sin_rot, self._image_shape)
-
-    def _point_to_tuple(self, value) -> tuple[float, float, float]:
-        """Normalize Point-like inputs to an (x, y, z) tuple."""
-        if hasattr(value, "x") and hasattr(value, "y"):
-            x = float(value.x)
-            y = float(value.y)
-            z = float(getattr(value, "z", 0.0))
-            return (x, y, z)
-        if isinstance(value, (tuple, list, np.ndarray)) and len(value) >= 2:
-            x = float(value[0])
-            y = float(value[1])
-            z = float(value[2]) if len(value) >= 3 else 0.0
-            return (x, y, z)
-        # Fallback: treat as origin
-        return (0.0, 0.0, 0.0)
-
-    def _debug_transform_vectors(self):
-        """Print sanity checks for world↔pixel transforms."""
-        self._debug_print("=== DEBUG TRANSFORM VECTORS ===")
-
-        test_points = [
-            (0, 0),
-            (1, 0),
-            (0, 1),
-            (1, 1)
-        ]
-
-        for (x, y) in test_points:
-            px = self._world_to_pixel((x, y))
-            if px is None:
-                self._debug_print(f"World ({x:.2f}, {y:.2f}) -> OUT OF FRAME")
-                continue
-
-            # px = (row, col) = (y, x)
-            try:
-                wx = self._pixel_to_world(px[1], px[0])
-                self._debug_print(f"World ({x:.2f}, {y:.2f}) -> Pixel {px} -> Reconstructed {wx}")
-            except Exception as e:
-                self._debug_print(f"[WARN] Failed to reconstruct for ({x:.2f}, {y:.2f}): {e}")
-
-    def transform_known_points(known_points_world, dx, dy, theta, to_pixel_fn):
-        """
-        Apply frame-to-frame translation and rotation to known world points, then
-        convert to pixel coordinates for plotting.
-        Args:
-            known_points_world: list of (x, y) in world coordinates (previous frame)
-            dx, dy: translation (meters) between frames
-            theta: rotation (radians, positive CCW)
-            to_pixel_fn: function handle like self._world_to_pixel
-
-        Returns:
-            known_points_px: list of (x_px, y_px) in pixel coords for the current frame
-        """
-        cos_t, sin_t = math.cos(theta), math.sin(theta)
-        known_points_px = []
-
-        for x, y in known_points_world:
-            # Rotate about origin (0,0)
-            x_rot = cos_t * x - sin_t * y
-            y_rot = sin_t * x + cos_t * y
-
-            # Translate
-            x_new = x_rot + dx
-            y_new = y_rot + dy
-
-            # Convert to pixel space
-            known_points_px.append(to_pixel_fn((x_new, y_new)))
-
-        return known_points_px
-
-    # Modified - visualize the graph, and nodes
-    def visualize_graph(
-        self,
-        output_dir: str = ".",
-        output_filename: str = "waypoint_graph.png",
-    ) -> None:
-        """
-        Create and save a visualization of the graph with node IDs.
-        Uses the existing map, node_map, and config colors.
-        """
-        if self._graph is None:
-            raise RuntimeError("No graph has been built yet")
-
-        self._logger.info("Starting visualization...")
-
-        # Convert map to color
-        map_vis = cv2.cvtColor(self._original_map, cv2.COLOR_GRAY2BGR)
-
-        # Ensure nearest node map exists
-        if self._node_map is None:
-            self._build_nearest_node_map(self._graph)
-
-        # --- Draw edges ---
-        edge_color = self._config.edge_color.to_tuple()
-        for u, v in self._graph.edges():
-            try:
-                src_y, src_x = self._graph.nodes[u]["pixel"]
-                dst_y, dst_x = self._graph.nodes[v]["pixel"]
-
-                cv2.line(map_vis, (src_x, src_y), (dst_x, dst_y), edge_color, 1)
-            except KeyError:
-                continue
-
-        # --- Optional: overlay node map mask (for debug) ---
-        overlay = cv2.applyColorMap(
-            ((self._node_map > -1).astype(np.uint8) * 180).astype(np.uint8),
-            cv2.COLORMAP_JET,
-        )
-        map_vis = cv2.addWeighted(map_vis, 0.8, overlay, 0.2, 0)
-
-        # --- Save output ---
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, output_filename)
-        if not cv2.imwrite(output_path, map_vis):
-            raise RuntimeError(f"Failed to save visualization to {output_path}")
-
-        self._logger.info(f"Saved visualization with node IDs to {output_path}")
-
-
-    def get_node_ids(self, points: list[Point]) -> list[Optional[int]]:
-        """
-        Find the nearest graph node to each query point on the node lookup map.
-
-        Args:
-            points: List of Point objects containing x, y, z coordinates in the world frame
-
-        Returns:
-            List of node indices (None if no valid path exists)
-        """
-        if self._graph is None:
-            raise RuntimeError("No graph has been built yet")
-
-        if self._node_map is None:
-            self._build_nearest_node_map(self._graph)
-
-        results = []
-        for point in points:
-            y, x = self._world_to_pixel(point)
-            if not self._is_within_bounds(y, x):
-                results.append(None)
-                continue
-            label = self._node_map[y, x]
-            if label < 0:
-                results.append(None)
-            else:
-                results.append(int(label))
-
-        return results
+    # ==========================================================
+    # Acceleration structures
+    # ==========================================================
 
     @numba.njit
     def _flood_fill_numba(node_map, nodes, width):
@@ -1705,101 +1098,32 @@ class WaypointGraphGenerator:
         self._node_map = np.full((height, width), -1, dtype=np.int32)
         self._node_map[self._original_map <= self._occupancy_threshold] = -2
 
-        if len(graph) == 0:  # Empty graph
+        if len(graph) == 0:
             return
 
-       # --- SAFETY NORMALIZATION ---
         cleaned_nodes = []
+
         for i, (node, pix) in enumerate(graph.nodes(data="pixel")):
             if pix is None:
-                # fallback: use node key if it looks like coordinates
-                if isinstance(node, tuple) and len(node) == 2:
-                    y, x = node
-                else:
-                    self._debug_print(f"[WARN] Node {node} missing pixel info — skipped.")
-                    continue
-            elif isinstance(pix, np.ndarray):
-                arr = np.array(pix).flatten()
-                if arr.size < 2:
-                    skipped += 1
-                    continue
-                y, x = arr[:2]
-            elif isinstance(pix, list):
-                # handle [[y, x]] or [y, x]
-                if len(pix) == 1 and isinstance(pix[0], (list, tuple)):
-                    y, x = pix[0][:2]
-                else:
-                    y, x = pix[:2]
-            elif isinstance(pix, tuple) and len(pix) >= 2:
-                y, x = pix[:2]
-            else:
-                self._debug_print(f"[WARN] Unexpected pixel format for node {node}: {pix}")
                 continue
-
             try:
-                y, x = pix[:2]
-            except Exception as e:
-                self._debug_print(f"[ERROR] Could not clean node {node}: {pix} ({e})")
+                y, x = int(pix[0]), int(pix[1])
+            except Exception:
                 continue
-
-            cleaned_nodes.append((i, y * width + x))
-        # --------------------------------
+            if 0 <= y < height and 0 <= x < width:
+                cleaned_nodes.append((i, y * width + x))
 
         if not cleaned_nodes:
             self._logger.warning("[WARN] No valid pixel nodes for nearest-node map.")
             return
-        
 
         graph_pixels = np.array(cleaned_nodes, dtype=np.int32)
-        node_map = self._node_map.reshape(-1)
-        WaypointGraphGenerator._flood_fill_numba(node_map, graph_pixels, width)
+        node_map_flat = self._node_map.reshape(-1)
+
+        WaypointGraphGenerator._flood_fill_numba(
+            node_map_flat,
+            graph_pixels,
+            width
+        )
+
         self._logger.info("Nearest node map built")
-
-    def _to_pixels(self, meters: float) -> float:
-        """Convert a distance from meters to pixels."""
-        if self._resolution is None:
-            raise ValueError("Resolution not set. Call build_graph_from_grid_map first.")
-        return meters / self._resolution
-
-    def _to_pixels_int(self, meters: float) -> int:
-        """Convert a distance from meters to pixels and round to integer."""
-        return int(self._to_pixels(meters))
-
-
-    def _debug_plot_with_known_points(self, known_points_px=None, new_points_px=None, title="Debug Known Points", save_path="debug_plots"):
-        """
-        Save a debug visualization of the map, inflated map, and any known points overlaid.
-        Works in SSH/headless mode (no GUI).
-
-        Args:
-            known_points_px: list of (x_px, y_px) pixel coordinates to plot (optional)
-            title: figure title
-            save_path: directory to save the plot
-        """
-        import matplotlib.pyplot as plt
-
-        # Filter out any None or malformed entries
-        known_points_px = [p for p in known_points_px if p is not None and len(p) == 2]
-        new_points_px = [p for p in new_points_px if p is not None and len(p) == 2]
-
-        if len(known_points_px) == 0 and len(new_points_px) == 0:
-            self._logger.warning("[WARN] No valid points to plot in debug visualization.")
-            return
-
-        ys = [p[0] for p in known_points_px]
-        xs = [p[1] for p in known_points_px]
-        new_ys = [p[0] for p in new_points_px]
-        new_xs = [p[1] for p in new_points_px]
-
-        plt.figure(figsize=(6, 6))
-        plt.imshow(self._original_map, cmap='gray')
-        plt.scatter(xs, ys, c='lime', s=20, label='Known Points')
-        plt.scatter(new_xs, new_ys, c='red', s=15, label='New Points')
-        plt.title(title)
-        plt.legend()
-        plt.tight_layout()
-
-        save_path = f"debug_stages/{title}.png"
-        plt.savefig(save_path)
-        plt.close()
-        self._debug_print(f"[DEBUG] Saved {save_path}")
