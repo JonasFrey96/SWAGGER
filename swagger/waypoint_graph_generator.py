@@ -53,6 +53,10 @@ class WaypointGraphGeneratorConfig:
     use_delaunay_shortcuts: bool = True
     prune_graph: bool = True
 
+    debug: bool = False
+    skeleton_sample_distance: float = 1.5
+    use_skeleton_graph: bool = True
+
     def __post_init__(self):
         """Validate configuration parameters after initialization."""
         # List of float parameters that must be positive
@@ -61,6 +65,7 @@ class WaypointGraphGeneratorConfig:
             "free_space_sampling_threshold",
             "merge_node_distance",
             "min_subgraph_length",
+            "skeleton_sample_distance",
         ]
 
         # Check each parameter
@@ -76,7 +81,7 @@ class WaypointGraphGenerator:
     """Generates a waypoint graph from an occupancy grid map."""
     def __init__(
         self,
-        config: WaypointGraphGeneratorConfig = WaypointGraphGeneratorConfig(),
+        config: WaypointGraphGeneratorConfig | None = None,
         logger_level: int = logging.INFO
     ):
         self._graph: nx.Graph | None = None             # Store the current graph
@@ -99,6 +104,7 @@ class WaypointGraphGenerator:
         self._logger = Logger(__name__, level=logger_level)
 
         self._node_map: np.ndarray | None = None
+        self._known_points: list[tuple[float, float]] = []
 
     @property
     def graph(self) -> nx.Graph:
@@ -117,6 +123,7 @@ class WaypointGraphGenerator:
         x_offset: float = 0.0,
         y_offset: float = 0.0,
         rotation: float = 0.0,
+        known_points: list = None,
     ) -> nx.Graph:
         """Build a waypoint graph from an occupancy grid map.
 
