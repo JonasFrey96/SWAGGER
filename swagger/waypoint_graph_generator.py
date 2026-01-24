@@ -211,6 +211,7 @@ class WaypointGraphGenerator:
         remove_nodes = []
 
         for node, data in graph.nodes(data=True):
+            data['node_type'] = 'free_space'
             if "pixel" not in data and "world" not in data:
                 remove_nodes.append(node)
                 continue

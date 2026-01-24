@@ -473,7 +473,7 @@ class GlobalGraphGenerator:
         for i, nid in enumerate(final_ids.cpu().tolist()):
             if new_local_mask[i]:
                 world = local_worlds[i].cpu().tolist()
-                global_graph.add_node(nid, world=tuple(world), node_type="free_space", origin="new")
+                global_graph.add_node(nid, world=tuple(world), node_type=local_graph.nodes[local_nodes[i]]["node_type"], origin="new")
             # Optional: mark usage _node_usage[nid] = 1.0
 
         # -------------------------
