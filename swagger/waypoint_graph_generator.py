@@ -286,12 +286,22 @@ class WaypointGraphGenerator:
     # Map preprocessing
     # ==========================================================
 
+    # def _distance_transform(self, free_map: np.ndarray):
+    #     """Inflate obstacles in the occupancy grid using a distance transform."""
+    #     free_map = np.pad(free_map, ((1, 1), (1, 1)), mode="constant", constant_values=0)
+    #     self._dist_transform = cv2.distanceTransform(free_map, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    #     self._inflated_map = (self._dist_transform < self._safety_distance / self._resolution).astype(np.uint8)
+    #     self._inflated_map = self._inflated_map[1:-1, 1:-1]
+    
     def _distance_transform(self, free_map: np.ndarray):
-        """Inflate obstacles in the occupancy grid using a distance transform."""
         free_map = np.pad(free_map, ((1, 1), (1, 1)), mode="constant", constant_values=0)
-        self._dist_transform = cv2.distanceTransform(free_map, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        self._inflated_map = (self._dist_transform < self._safety_distance / self._resolution).astype(np.uint8)
-        self._inflated_map = self._inflated_map[1:-1, 1:-1]
+        dist = cv2.distanceTransform(free_map, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        dist = dist[1:-1, 1:-1]
+        self._dist_transform = dist
+
+        inflation_px = self._config.boundary_inflation_factor * (self._safety_distance / self._resolution)
+        self._inflated_map = (dist < inflation_px).astype(np.uint8)
+
 
     def _free_mask_from_map(self, occupancy: np.ndarray) -> np.ndarray:
         """Return binary mask of free space (1 = free)."""

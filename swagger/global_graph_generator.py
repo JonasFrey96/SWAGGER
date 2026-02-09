@@ -44,9 +44,9 @@ class GlobalGraphGenerator:
     boundary_increment: float = 0.2
     boundary_decay: float = 0.9
     boundary_cell_size: float = 0.05
-    max_connections: int = 10
+    max_connections: int = 15
     pruning_frequency: int = 6 
-    max_candidate_edge_distance: float = 0.8
+    max_candidate_edge_distance: float = 0.5
     max_candidate_edge_search_distance: float = 10
 
     occ_grid: np.ndarray = None            # 255 = free, 0 = occupied
