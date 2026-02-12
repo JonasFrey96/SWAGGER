@@ -67,8 +67,8 @@ class GlobalGraphGenerator:
     sparsification_distance: float = 0.5                  # must be > merge.distance. check navigation_graph_node
     frontier_hop_buffer: int = 3                          # BFS from frontier and how many edges to hop
     sparsification_frequency: int = 20                    # num of local graph updates for sparisficiation cycle to begin
-    _sparsify_counter: int = field(default=0, init=False)
-    _prune_counter: int = field(default=0, init=False)
+    _sparsify_counter: int = field(default=0, init=True)
+    _prune_counter: int = field(default=0, init=True_pr)
 
     def _occ_origin(self):
         if self.occ_grid is None:
@@ -403,7 +403,8 @@ class GlobalGraphGenerator:
         ############# ADDING EDGES TO THE GRAPH END ##################
         """
         
-        self._prune_redundant_edges()
+        # self._prune_redundant_edges()
+        self._prune_and_sparsify()
 
 
     def tensor_merge_local_nodes(self, local_graph, global_graph: nx.Graph, global_worlds: torch.tensor, global_ids_tensor: torch.tensor ,next_node_id, merge_distance, device="cuda"):
@@ -735,85 +736,177 @@ class GlobalGraphGenerator:
         settled = free_space_nodes - protected
         return settled, frontier_nodes
 
-def sparsify_explored_regions(self) -> int:
-        """
-        Takes in the settled nodes and does KDTree on them.
-        """
-        G = self.global_graph
-        if G.number_of_nodes() < 2:
-            return 0
+    def sparsify_explored_regions(self) -> int:
+            """
+            Takes in the settled nodes and does KDTree on them.
+            """
+            G = self.global_graph
+            if G.number_of_nodes() < 2:
+                return 0
 
-        settled, _ = self._find_settled_nodes()
-        if len(settled) < 2:
-            return 0
+            settled, _ = self._find_settled_nodes()
+            if len(settled) < 2:
+                return 0
 
-        settled_list = list(settled)
-        positions = np.array(
-            [G.nodes[n]["world"][:2] for n in settled_list],
-            dtype=np.float64,
-        )
+            settled_list = list(settled)
+            positions = np.array(
+                [G.nodes[n]["world"][:2] for n in settled_list],
+                dtype=np.float64,
+            )
 
-        tree = cKDTree(positions)
-        pairs = tree.query_pairs(r=self.sparsification_distance)
-        if not pairs:
-            return 0
-        
-        pair_list = []
-        for i, j in pairs:
-            d = np.linalg.norm(positions[i] - positions[j])
-            pair_list.append((d, settled_list[i], settled_list[j]))
-        pair_list.sort()
+            tree = cKDTree(positions)
+            pairs = tree.query_pairs(r=self.sparsification_distance)
+            if not pairs:
+                return 0
+            
+            pair_list = []
+            for i, j in pairs:
+                d = np.linalg.norm(positions[i] - positions[j])
+                pair_list.append((d, settled_list[i], settled_list[j]))
+            pair_list.sort()
 
-        removed_set: Set[int] = set()
-        new_edges: List[Tuple[int, int]] = []
-        removed_count = 0
+            removed_set: Set[int] = set()
+            new_edges: List[Tuple[int, int]] = []
+            removed_count = 0
 
-        for _, node_a, node_b in pair_list:
-            if node_a in removed_set or node_b in removed_set:
-                continue
-            if not G.has_node(node_a) or not G.has_node(node_b):
-                continue
-
-            # Keep the more connected node
-            if G.degree(node_a) >= G.degree(node_b):
-                keep, remove = node_a, node_b
-            else:
-                keep, remove = node_b, node_a
-            wk = G.nodes[keep]["world"]
-            wr = G.nodes[remove]["world"]
-            midpoint = tuple((wk[i] + wr[i]) / 2.0 for i in range(len(wk)))
-            G.nodes[keep]["world"] = midpoint
-            mid_xy = midpoint[:2]
-
-            for nbr in list(G.neighbors(remove)):
-                if nbr == keep or nbr in removed_set:
+            for _, node_a, node_b in pair_list:
+                if node_a in removed_set or node_b in removed_set:
+                    continue
+                if not G.has_node(node_a) or not G.has_node(node_b):
                     continue
 
-                w_nbr = G.nodes[nbr]["world"][:2]
-                new_weight = math.sqrt(
-                    (mid_xy[0] - w_nbr[0]) ** 2 +
-                    (mid_xy[1] - w_nbr[1]) ** 2
-                )
-
-                if G.has_edge(keep, nbr):
-                    existing_weight = G[keep][nbr].get("weight", float("inf"))
-                    if new_weight < existing_weight:
-                        G[keep][nbr]["weight"] = new_weight
-                        new_edges.append((keep, nbr))  # geometry changed, needs check
-                    # else: existing edge unchanged, no collision check needed
+                # Keep the more connected node
+                if G.degree(node_a) >= G.degree(node_b):
+                    keep, remove = node_a, node_b
                 else:
-                    G.add_edge(keep, nbr, weight=new_weight)
-                    new_edges.append((keep, nbr))
+                    keep, remove = node_b, node_a
+                wk = G.nodes[keep]["world"]
+                wr = G.nodes[remove]["world"]
+                midpoint = tuple((wk[i] + wr[i]) / 2.0 for i in range(len(wk)))
+                G.nodes[keep]["world"] = midpoint
+                mid_xy = midpoint[:2]
 
-            G.remove_node(remove)
-            removed_set.add(remove)
-            removed_count += 1
+                for nbr in list(G.neighbors(remove)):
+                    if nbr == keep or nbr in removed_set:
+                        continue
 
-        # ─── Validate ONLY new/modified edges ───
-        print(f"the number of removed nodes in sparsify is {removed_count}")
-        if new_edges and removed_count > 0:
+                    w_nbr = G.nodes[nbr]["world"][:2]
+                    new_weight = math.sqrt(
+                        (mid_xy[0] - w_nbr[0]) ** 2 +
+                        (mid_xy[1] - w_nbr[1]) ** 2
+                    )
+
+                    if G.has_edge(keep, nbr):
+                        existing_weight = G[keep][nbr].get("weight", float("inf"))
+                        if new_weight < existing_weight:
+                            G[keep][nbr]["weight"] = new_weight
+                            new_edges.append((keep, nbr))  # geometry changed, needs check
+                        # else: existing edge unchanged, no collision check needed
+                    else:
+                        G.add_edge(keep, nbr, weight=new_weight)
+                        new_edges.append((keep, nbr))
+
+                G.remove_node(remove)
+                removed_set.add(remove)
+                removed_count += 1
+
+            # ─── Validate ONLY new/modified edges ───
+            print(f"the number of removed nodes in sparsify is {removed_count}")
+            if new_edges and removed_count > 0:
+                mst_edges = self._compute_mst_edges()
+                self._validate_new_edges(new_edges, mst_edges)
+
+            return removed_count
+    
+    def _validate_new_edges(
+        self,
+        edges_to_check: List[Tuple[int, int]],
+        mst_edges: Set[FrozenSet],
+    ) -> int:
+        """
+        Collision-check only the specified edges (newly created/rewired).
+        Remove colliding ones unless they're in the MST.
+        Returns number of edges removed.
+        """
+        G = self.global_graph
+        if not edges_to_check or self.occ_grid is None:
+            return 0
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Deduplicate and filter to edges that still exist
+        p1_list, p2_list, valid_edges = [], [], []
+        seen: Set[FrozenSet] = set()
+        for u, v in edges_to_check:
+            edge_key = frozenset((u, v))
+            if edge_key in seen:
+                continue
+            seen.add(edge_key)
+
+            if not G.has_node(u) or not G.has_node(v):
+                continue
+            if not G.has_edge(u, v):
+                continue
+            if "world" not in G.nodes[u] or "world" not in G.nodes[v]:
+                continue
+
+            p1_list.append(G.nodes[u]["world"][:2])
+            p2_list.append(G.nodes[v]["world"][:2])
+            valid_edges.append((u, v))
+
+        if not valid_edges:
+            return 0
+
+        p1 = torch.tensor(p1_list, dtype=torch.float32, device=device)
+        p2 = torch.tensor(p2_list, dtype=torch.float32, device=device)
+        dummy_ids = torch.zeros(len(valid_edges), dtype=torch.int64, device=device)
+
+        collision_free = self.batch_collision_check(p1, p2, dummy_ids, dummy_ids)
+
+        # Remove colliding non-MST edges
+        collision_mask = collision_free.cpu().tolist()
+        removed = 0
+        for i, is_free in enumerate(collision_mask):
+            if not is_free:
+                u, v = valid_edges[i]
+                if frozenset((u, v)) not in mst_edges:
+                    G.remove_edge(u, v)
+                    removed += 1
+
+        return removed
+
+    def _prune_redundant_edges_mst_safe(self, mst_edges: Set[FrozenSet] = None) -> None:
+        """
+        Limit node degree to max_connections by dropping the longest
+        non-MST edges.
+        """
+        G = self.global_graph
+        if G.number_of_edges() == 0:
+            return
+
+        if mst_edges is None:
             mst_edges = self._compute_mst_edges()
-            self._validate_new_edges(new_edges, mst_edges)
 
-        return removed_count
+        edges_to_remove = []
+
+        for node in G.nodes():
+            neighbors = list(G.neighbors(node))
+            if len(neighbors) <= self.max_connections:
+                continue
+
+            neighbor_weights = [
+                (G[node][nbr].get("weight", float("inf")), nbr)
+                for nbr in neighbors
+            ]
+            neighbor_weights.sort()
+
+            kept = 0
+            for weight, nbr in neighbor_weights:
+                if kept < self.max_connections:
+                    kept += 1
+                else:
+                    if frozenset((node, nbr)) not in mst_edges:
+                        edges_to_remove.append((node, nbr))
+
+        G.remove_edges_from(edges_to_remove)
 
