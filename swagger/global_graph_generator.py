@@ -377,13 +377,15 @@ class GlobalGraphGenerator:
         add_end = torch.cuda.Event(enable_timing=True)
         add_start.record()
 
-        edges = list(zip(
-            local_nodes.cpu().tolist(),
-            global_nodes.cpu().tolist(),
-            weights.cpu().tolist()
-        ))
+        # edges = list(zip(
+        #     local_nodes.cpu().tolist(),
+        #     global_nodes.cpu().tolist(),
+        #     weights.cpu().tolist()
+        # ))
+        
+        edge_data = torch.stack([local_nodes, global_nodes, weights], dim=1).cpu().tolist()
+        edges = [(int(row[0]), int(row[1]), row[2]) for row in edge_data]
         self.global_graph.add_weighted_edges_from(edges)
-
         add_end.record()
         torch.cuda.synchronize()
         add_edges_ms = add_start.elapsed_time(add_end)
