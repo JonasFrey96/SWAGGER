@@ -25,7 +25,7 @@ import string
 import math
 from collections import deque
 from scipy.spatial import Delaunay, cKDTree
-
+from pytictac import CpuTimer
 @dataclass
 class GlobalGraphGenerator:
     """Incrementally build a stitched global graph.
@@ -47,7 +47,8 @@ class GlobalGraphGenerator:
     boundary_decay: float = 0.9
     boundary_cell_size: float = 0.05
     max_connections: int = 15
-    pruning_frequency: int = 6 
+    # pruning_frequency: int = 6
+    pruning_frequency: int = 10 
     max_candidate_edge_distance: float = 0.5
     max_candidate_edge_search_distance: float = 10
 
@@ -57,7 +58,6 @@ class GlobalGraphGenerator:
 
     _colliding_edges: Set[Tuple[int, int]] = field(default_factory=set, init=False)
 
-
     global_graph: nx.Graph = field(default_factory=nx.Graph, init=False)
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
@@ -65,10 +65,10 @@ class GlobalGraphGenerator:
 
     ## parameters for efficient SWAGGER graph
     sparsification_distance: float = 0.5                  # must be > merge.distance. check navigation_graph_node
-    frontier_hop_buffer: int = 3                          # BFS from frontier and how many edges to hop
+    frontier_hop_buffer: int = 4                          # BFS from frontier and how many edges to hop
     sparsification_frequency: int = 20                    # num of local graph updates for sparisficiation cycle to begin
     _sparsify_counter: int = field(default=0, init=True)
-    _prune_counter: int = field(default=0, init=True_pr)
+    _prune_counter: int = field(default=0, init=True)
 
     def _occ_origin(self):
         if self.occ_grid is None:
@@ -404,7 +404,8 @@ class GlobalGraphGenerator:
         """
         
         # self._prune_redundant_edges()
-        self._prune_and_sparsify()
+        with CpuTimer("timing the pruning and sparsify"):
+            self._prune_and_sparsify()
 
 
     def tensor_merge_local_nodes(self, local_graph, global_graph: nx.Graph, global_worlds: torch.tensor, global_ids_tensor: torch.tensor ,next_node_id, merge_distance, device="cuda"):
@@ -677,16 +678,18 @@ class GlobalGraphGenerator:
         self._sparsify_counter += 1
 
         run_prune = (self._prune_counter % self.pruning_frequency == 0)
-        run_sparsify = (self._sparsify_counter % self.pruning_frequency == 0)
+        run_sparsify = (self._sparsify_counter % self.sparsification_frequency == 0)
 
         if not run_prune and not run_sparsify:
             return 
 
         if run_prune:
+            print("pruning is running")
             mst_edges = self._compute_mst_edges()
-            self._prune_redundant_edges_mst_safe()
+            self._prune_redundant_edges_mst_safe(mst_edges)
         
         if run_sparsify:
+            print("sparsify graph working")
             self.sparsify_explored_regions()
     
     def _find_settled_nodes(self) -> Tuple[Set[int], List[int]]:
@@ -720,7 +723,7 @@ class GlobalGraphGenerator:
         protected: Set[int] = set()
 
         if frontier_nodes:
-            visited = Set[int] = set(frontier_nodes)
+            visited: Set[int] = set(frontier_nodes)
             queue = deque((n, 0) for n in frontier_nodes)
 
             while queue:
@@ -737,86 +740,88 @@ class GlobalGraphGenerator:
         return settled, frontier_nodes
 
     def sparsify_explored_regions(self) -> int:
-            """
-            Takes in the settled nodes and does KDTree on them.
-            """
-            G = self.global_graph
-            if G.number_of_nodes() < 2:
-                return 0
+        """
+        Takes in the settled nodes and does KDTree on them.
+        """
+        G = self.global_graph
+        print(G.number_of_nodes())
+        if G.number_of_nodes() < 2:
+            return 0
 
-            settled, _ = self._find_settled_nodes()
-            if len(settled) < 2:
-                return 0
+        settled, _ = self._find_settled_nodes()
+        print(f"number of settled nodes are {len(settled)}")
+        if len(settled) < 2:
+            return 0
 
-            settled_list = list(settled)
-            positions = np.array(
-                [G.nodes[n]["world"][:2] for n in settled_list],
-                dtype=np.float64,
-            )
+        settled_list = list(settled)
+        positions = np.array(
+            [G.nodes[n]["world"][:2] for n in settled_list],
+            dtype=np.float64,
+        )
 
-            tree = cKDTree(positions)
-            pairs = tree.query_pairs(r=self.sparsification_distance)
-            if not pairs:
-                return 0
-            
-            pair_list = []
-            for i, j in pairs:
-                d = np.linalg.norm(positions[i] - positions[j])
-                pair_list.append((d, settled_list[i], settled_list[j]))
-            pair_list.sort()
+        tree = cKDTree(positions)
+        pairs = tree.query_pairs(r=self.sparsification_distance)
+        if not pairs:
+            return 0
+        
+        pair_list = []
+        for i, j in pairs:
+            d = np.linalg.norm(positions[i] - positions[j])
+            pair_list.append((d, settled_list[i], settled_list[j]))
+        pair_list.sort()
 
-            removed_set: Set[int] = set()
-            new_edges: List[Tuple[int, int]] = []
-            removed_count = 0
+        removed_set: Set[int] = set()
+        new_edges: List[Tuple[int, int]] = []
+        removed_count = 0
 
-            for _, node_a, node_b in pair_list:
-                if node_a in removed_set or node_b in removed_set:
+        for _, node_a, node_b in pair_list:
+            if node_a in removed_set or node_b in removed_set:
+                continue
+            if not G.has_node(node_a) or not G.has_node(node_b):
+                continue
+
+            # Keep the more connected node
+            if G.degree(node_a) >= G.degree(node_b):
+                keep, remove = node_a, node_b
+            else:
+                keep, remove = node_b, node_a
+            wk = G.nodes[keep]["world"]
+            wr = G.nodes[remove]["world"]
+            midpoint = tuple((wk[i] + wr[i]) / 2.0 for i in range(len(wk)))
+            G.nodes[keep]["world"] = midpoint
+            mid_xy = midpoint[:2]
+
+            for nbr in list(G.neighbors(remove)):
+                if nbr == keep or nbr in removed_set:
                     continue
-                if not G.has_node(node_a) or not G.has_node(node_b):
-                    continue
 
-                # Keep the more connected node
-                if G.degree(node_a) >= G.degree(node_b):
-                    keep, remove = node_a, node_b
+                w_nbr = G.nodes[nbr]["world"][:2]
+                new_weight = math.sqrt(
+                    (mid_xy[0] - w_nbr[0]) ** 2 +
+                    (mid_xy[1] - w_nbr[1]) ** 2
+                )
+
+                if G.has_edge(keep, nbr):
+                    existing_weight = G[keep][nbr].get("weight", float("inf"))
+                    if new_weight < existing_weight:
+                        G[keep][nbr]["weight"] = new_weight
+                        new_edges.append((keep, nbr))  # geometry changed, needs check
+                    # else: existing edge unchanged, no collision check needed
                 else:
-                    keep, remove = node_b, node_a
-                wk = G.nodes[keep]["world"]
-                wr = G.nodes[remove]["world"]
-                midpoint = tuple((wk[i] + wr[i]) / 2.0 for i in range(len(wk)))
-                G.nodes[keep]["world"] = midpoint
-                mid_xy = midpoint[:2]
+                    G.add_edge(keep, nbr, weight=new_weight)
+                    new_edges.append((keep, nbr))
 
-                for nbr in list(G.neighbors(remove)):
-                    if nbr == keep or nbr in removed_set:
-                        continue
+            G.remove_node(remove)
+            removed_set.add(remove)
+            removed_count += 1
 
-                    w_nbr = G.nodes[nbr]["world"][:2]
-                    new_weight = math.sqrt(
-                        (mid_xy[0] - w_nbr[0]) ** 2 +
-                        (mid_xy[1] - w_nbr[1]) ** 2
-                    )
+        # ─── Validate ONLY new/modified edges ───
+        print(f"the number of removed nodes in sparsify is {removed_count}")
+        if new_edges and removed_count > 0:
+            mst_edges = self._compute_mst_edges()
+            self._validate_new_edges(new_edges, mst_edges)
 
-                    if G.has_edge(keep, nbr):
-                        existing_weight = G[keep][nbr].get("weight", float("inf"))
-                        if new_weight < existing_weight:
-                            G[keep][nbr]["weight"] = new_weight
-                            new_edges.append((keep, nbr))  # geometry changed, needs check
-                        # else: existing edge unchanged, no collision check needed
-                    else:
-                        G.add_edge(keep, nbr, weight=new_weight)
-                        new_edges.append((keep, nbr))
-
-                G.remove_node(remove)
-                removed_set.add(remove)
-                removed_count += 1
-
-            # ─── Validate ONLY new/modified edges ───
-            print(f"the number of removed nodes in sparsify is {removed_count}")
-            if new_edges and removed_count > 0:
-                mst_edges = self._compute_mst_edges()
-                self._validate_new_edges(new_edges, mst_edges)
-
-            return removed_count
+        return removed_count
     
     def _validate_new_edges(
         self,
