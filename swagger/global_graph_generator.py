@@ -13,7 +13,7 @@ networkx graph. It handles:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Iterable, Set
+from typing import Dict, Tuple, Iterable, Set, FrozenSet, List
 import math
 
 import cv2
@@ -22,7 +22,9 @@ import networkx as nx
 import torch
 import cupy as cp
 import string
-
+import math
+from collections import deque
+from scipy.spatial import Delaunay, cKDTree
 
 @dataclass
 class GlobalGraphGenerator:
@@ -60,6 +62,13 @@ class GlobalGraphGenerator:
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
     _boundary_probs: Dict[Tuple[int, int], float] = field(default_factory=dict, init=False)
+
+    ## parameters for efficient SWAGGER graph
+    sparsification_distance: float = 0.5                  # must be > merge.distance. check navigation_graph_node
+    frontier_hop_buffer: int = 3                          # BFS from frontier and how many edges to hop
+    sparsification_frequency: int = 20                    # num of local graph updates for sparisficiation cycle to begin
+    _sparsify_counter: int = field(default=0, init=False)
+    _prune_counter: int = field(default=0, init=False)
 
     def _occ_origin(self):
         if self.occ_grid is None:
@@ -382,7 +391,7 @@ class GlobalGraphGenerator:
         #     global_nodes.cpu().tolist(),
         #     weights.cpu().tolist()
         # ))
-        
+
         edge_data = torch.stack([local_nodes, global_nodes, weights], dim=1).cpu().tolist()
         edges = [(int(row[0]), int(row[1]), row[2]) for row in edge_data]
         self.global_graph.add_weighted_edges_from(edges)
@@ -629,3 +638,182 @@ class GlobalGraphGenerator:
             cv2.circle(canvas, (x, y), 3, color, -1)
 
         cv2.imwrite(path, canvas)
+    
+    def _compute_mst_edges(self) -> Set[FrozenSet]:
+        """
+        Compute MST edges across all connected components.
+        Returns a set of frozensets for O(1) membership checks.
+        """
+        G = self.global_graph
+        mst_edges: Set[FrozenSet] = set()
+
+        for comp in nx.connected_components(G):
+            sg = G.subgraph(comp)
+            if sg.number_of_edges() > 0:
+                try:
+                    mst = nx.minimum_spanning_tree(sg, weight="weight")
+                    mst_edges.update(frozenset(e) for e in mst.edges())
+                except Exception:
+                    pass
+
+        return mst_edges
+    
+    def _prune_and_sparsify(self) -> None:
+        """
+        1. Logic is at some time intervals, do BFS on the frontier nodes and then till frontier_hop_buffer hops
+        from the frontier nodes and mark them + frontiers.
+        2. Then for the free space nodes we form a KDTree of distance sparsification_distance around the free spaces and mark these nodes.
+        3. We also do the MST of the graph to make sure when we prune the edges we do not hurt the connectivity of the graph.
+        """
+        
+        G = self.global_graph
+        
+        if G.number_of_nodes() == 0:
+            self._sparsify_counter += 1
+            return
+        
+        self._prune_counter += 1
+        self._sparsify_counter += 1
+
+        run_prune = (self._prune_counter % self.pruning_frequency == 0)
+        run_sparsify = (self._sparsify_counter % self.pruning_frequency == 0)
+
+        if not run_prune and not run_sparsify:
+            return 
+
+        if run_prune:
+            mst_edges = self._compute_mst_edges()
+            self._prune_redundant_edges_mst_safe()
+        
+        if run_sparsify:
+            self.sparsify_explored_regions()
+    
+    def _find_settled_nodes(self) -> Tuple[Set[int], List[int]]:
+        """
+        pass over all the global nodes (i know it's inefficient but over time should reduce computation)
+        mark frontiers -> BFS source
+        mark free_space -> unprotected
+
+        mark frontiers to free_space nodes as protected.
+        Returns Set(settled nodes), frontier nodes(list)
+        """
+        G = self.global_graph
+        hop_buffer = self.frontier_hop_buffer
+
+        frontier_nodes = []
+        free_space_nodes = set()
+
+        for n, d in G.nodes(data=True):
+            node_type = d.get("node_type")
+
+            if node_type == "frontier":
+                ## NOTE: need to check whether frontier is being given 1 or "frontier"
+                frontier_nodes.append(n)
+            if node_type == "free_space":
+                free_space_nodes.add(n)
+        
+        if not free_space_nodes:
+            print(f"couldn't find any free space node")
+            return set(), frontier_nodes
+        
+        protected: Set[int] = set()
+
+        if frontier_nodes:
+            visited = Set[int] = set(frontier_nodes)
+            queue = deque((n, 0) for n in frontier_nodes)
+
+            while queue:
+                node, depth = queue.popleft()
+                protected.add(node)
+                if depth >= hop_buffer:
+                    continue
+                
+                for nbr in G.neighbors(node):
+                    visited.add(nbr)
+                    queue.append((nbr, depth + 1))
+        
+        settled = free_space_nodes - protected
+        return settled, frontier_nodes
+
+def sparsify_explored_regions(self) -> int:
+        """
+        Takes in the settled nodes and does KDTree on them.
+        """
+        G = self.global_graph
+        if G.number_of_nodes() < 2:
+            return 0
+
+        settled, _ = self._find_settled_nodes()
+        if len(settled) < 2:
+            return 0
+
+        settled_list = list(settled)
+        positions = np.array(
+            [G.nodes[n]["world"][:2] for n in settled_list],
+            dtype=np.float64,
+        )
+
+        tree = cKDTree(positions)
+        pairs = tree.query_pairs(r=self.sparsification_distance)
+        if not pairs:
+            return 0
+        
+        pair_list = []
+        for i, j in pairs:
+            d = np.linalg.norm(positions[i] - positions[j])
+            pair_list.append((d, settled_list[i], settled_list[j]))
+        pair_list.sort()
+
+        removed_set: Set[int] = set()
+        new_edges: List[Tuple[int, int]] = []
+        removed_count = 0
+
+        for _, node_a, node_b in pair_list:
+            if node_a in removed_set or node_b in removed_set:
+                continue
+            if not G.has_node(node_a) or not G.has_node(node_b):
+                continue
+
+            # Keep the more connected node
+            if G.degree(node_a) >= G.degree(node_b):
+                keep, remove = node_a, node_b
+            else:
+                keep, remove = node_b, node_a
+            wk = G.nodes[keep]["world"]
+            wr = G.nodes[remove]["world"]
+            midpoint = tuple((wk[i] + wr[i]) / 2.0 for i in range(len(wk)))
+            G.nodes[keep]["world"] = midpoint
+            mid_xy = midpoint[:2]
+
+            for nbr in list(G.neighbors(remove)):
+                if nbr == keep or nbr in removed_set:
+                    continue
+
+                w_nbr = G.nodes[nbr]["world"][:2]
+                new_weight = math.sqrt(
+                    (mid_xy[0] - w_nbr[0]) ** 2 +
+                    (mid_xy[1] - w_nbr[1]) ** 2
+                )
+
+                if G.has_edge(keep, nbr):
+                    existing_weight = G[keep][nbr].get("weight", float("inf"))
+                    if new_weight < existing_weight:
+                        G[keep][nbr]["weight"] = new_weight
+                        new_edges.append((keep, nbr))  # geometry changed, needs check
+                    # else: existing edge unchanged, no collision check needed
+                else:
+                    G.add_edge(keep, nbr, weight=new_weight)
+                    new_edges.append((keep, nbr))
+
+            G.remove_node(remove)
+            removed_set.add(remove)
+            removed_count += 1
+
+        # ─── Validate ONLY new/modified edges ───
+        print(f"the number of removed nodes in sparsify is {removed_count}")
+        if new_edges and removed_count > 0:
+            mst_edges = self._compute_mst_edges()
+            self._validate_new_edges(new_edges, mst_edges)
+
+        return removed_count
+
