@@ -212,8 +212,6 @@ class GlobalGraphGenerator:
     def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid, resolution) -> None:
         """Merge a local graph into the persistent global graph with optimized vectorization."""
 
-        
-
         occ_grid = np.rot90(occ_grid, 2)  # To account for the occ grid convetion as per GridMap
         self.occ_center = (occ_center_x, occ_center_y)
         self.occ_grid = occ_grid
@@ -225,23 +223,21 @@ class GlobalGraphGenerator:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         
         global_ids = list(self.global_graph.nodes())
-        if global_ids:
+        if len(global_ids) > 0:
             global_pos = torch.tensor(
-                [self.global_graph.nodes[n]["world"][:2] for n in global_ids],
+                # [self.global_graph.nodes[n]["world"][:2] for n in global_ids],
+                [self.global_graph.nodes[n]["world"] for n in global_ids],
                 dtype=torch.float32,
                 device=device
             )
+            global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
         else:
-            global_pos = torch.empty((0, 2), dtype=torch.float32, device=device)
-
-        
+            global_pos = torch.empty((0, 3), dtype=torch.float32, device=device)
+            global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
 
         """
         ############# LOCAL NODE MERGING TO GLOBAL START ##################
         """
-            
-            
-        
         merge_start = torch.cuda.Event(enable_timing=True)
         merge_end = torch.cuda.Event(enable_timing=True)
         merge_start.record()
@@ -257,12 +253,10 @@ class GlobalGraphGenerator:
         merge_end.record()
         torch.cuda.synchronize()
         local_merge_ms = merge_start.elapsed_time(merge_end)
-        
-
+    
         if not local_ids:
             return
         
-
         """
         ############# LOCAL NODE MERGING TO GLOBAL END ##################
         """
@@ -276,7 +270,8 @@ class GlobalGraphGenerator:
         cand_start.record()
         
         local_pos = torch.tensor(
-            [self.global_graph.nodes[n]["world"][:2] for n in local_ids],
+            # [self.global_graph.nodes[n]["world"][:2] for n in local_ids],
+            [self.global_graph.nodes[n]["world"] for n in local_ids],
             dtype=torch.float32,
             device=device
         )
@@ -398,7 +393,7 @@ class GlobalGraphGenerator:
         self._prune_redundant_edges()
 
 
-    def tensor_merge_local_nodes(self, local_graph, global_graph, next_node_id, merge_distance, device="cuda"):
+    def tensor_merge_local_nodes(self, local_graph, global_graph: nx.Graph, global_worlds: torch.tensor, global_ids_tensor: torch.tensor ,next_node_id, merge_distance, device="cuda"):
         """
         Merge local graph nodes into global graph using fully vectorized GPU operations.
 
@@ -423,17 +418,17 @@ class GlobalGraphGenerator:
         # -------------------------
         # Extract global nodes
         # -------------------------
-        global_nodes = list(global_graph.nodes())
-        if len(global_nodes) > 0:
-            global_worlds = torch.tensor(
-                [global_graph.nodes[n]["world"] for n in global_nodes],
-                dtype=torch.float32,
-                device=device
-            )  # (M, D)
-            global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
-        else:
-            global_worlds = torch.empty((0, local_worlds.shape[1]), device=device)
-            global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
+        # global_nodes = list(global_graph.nodes())
+        # if len(global_nodes) > 0:
+        #     global_worlds = torch.tensor(
+        #         [global_graph.nodes[n]["world"] for n in global_nodes],
+        #         dtype=torch.float32,
+        #         device=device
+        #     )  # (M, D)
+        #     global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
+        # else:
+        #     global_worlds = torch.empty((0, local_worlds.shape[1]), device=device)
+        #     global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
 
         # -------------------------
         # CASE 1: Empty global graph
@@ -470,15 +465,33 @@ class GlobalGraphGenerator:
         # -------------------------
         # Update global graph with new nodes
         # -------------------------
-        for i, nid in enumerate(final_ids.cpu().tolist()):
-            if new_local_mask[i]:
-                world = local_worlds[i].cpu().tolist()
-                global_graph.add_node(nid, world=tuple(world), node_type=local_graph.nodes[local_nodes[i]]["node_type"], origin="new")
-            # Optional: mark usage _node_usage[nid] = 1.0
+        # for i, nid in enumerate(final_ids.cpu().tolist()):
+        #     if new_local_mask[i]:
+        #         world = local_worlds[i].cpu().tolist()
+        #         global_graph.add_node(nid, world=tuple(world), node_type=local_graph.nodes[local_nodes[i]]["node_type"], origin="new")
+        #     # Optional: mark usage _node_usage[nid] = 1.0
 
-        # -------------------------
-        # Return local_ids in same order as original loop
-        # -------------------------
+        # # -------------------------
+        # # Return local_ids in same order as original loop
+        # # -------------------------
+        final_ids_list = final_ids.cpu().tolist()
+        new_local_mask_cpu = new_local_mask.cpu().tolist()
+        local_worlds_cpu = local_worlds.cpu().tolist()  # single transfer, all at once
+        ## Batch building is more efficient. 
+        new_nodes = []
+        for i, nid in enumerate(final_ids_list):
+            if new_local_mask_cpu[i]:
+                new_nodes.append((
+                    nid,
+                    {
+                        "world": tuple(local_worlds_cpu[i]),
+                        "node_type": local_graph.nodes[local_nodes[i]]["node_type"],
+                        "origin": "new",
+                    }
+                ))
+
+        # Single networkx call
+        global_graph.add_nodes_from(new_nodes)
         local_ids = final_ids.cpu().tolist()
         return local_ids, updated_next_id
 
