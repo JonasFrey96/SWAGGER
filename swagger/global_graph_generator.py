@@ -246,7 +246,7 @@ class GlobalGraphGenerator:
             local_graph,
             self.global_graph,
             global_pos,
-            global_ids_tensor
+            global_ids_tensor,
             self._next_node_id,
             self.merge_distance,
             device=device
