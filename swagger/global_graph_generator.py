@@ -230,7 +230,7 @@ class GlobalGraphGenerator:
                 dtype=torch.float32,
                 device=device
             )
-            global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
+            global_ids_tensor = torch.tensor(global_ids, dtype=torch.long, device=device)
         else:
             global_pos = torch.empty((0, 3), dtype=torch.float32, device=device)
             global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
