@@ -64,7 +64,7 @@ from swagger.graph_manager import GraphManager
 from simulate_robot_graph_route import simulate_robot_graph_route
 from visualize_global_graph_on_image import visualize_global_graph_on_image
 import networkx as nx
-from swagger.global_graph_generator import GlobalGraphGenerator
+from ros.ros2_ws.src.SWAGGER.swagger.old_global_graph_generator import GlobalGraphGenerator
 from networkx.readwrite import json_graph
 
 
