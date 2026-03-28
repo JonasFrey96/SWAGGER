@@ -2,7 +2,7 @@
 
 This helper consumes per-frame/local graphs (such as the ones produced by
 ``WaypointGraphGenerator``) and incrementally builds a stitched, world-frame
-networkx graph. It handles:
+graph stored entirely as GPU tensors. It handles:
 
 * merging nearby free-space nodes (ignores skeleton nodes)
 * persisting/freeing nodes using a retention factor (0 → only current frame,
@@ -13,7 +13,7 @@ networkx graph. It handles:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Iterable, Set
+from typing import Dict, List, Tuple, Iterable, Set
 import math
 
 import cv2
@@ -23,10 +23,12 @@ import torch
 import cupy as cp
 import string
 
-
 @dataclass
 class GlobalGraphGenerator:
     """Incrementally build a stitched global graph.
+
+    The global graph is stored entirely as GPU tensors. Local graphs arrive as
+    networkx graphs and are converted to tensors during the merge step.
 
     Args:
         merge_distance: Maximum world-distance between two free-space nodes
@@ -45,7 +47,7 @@ class GlobalGraphGenerator:
     boundary_decay: float = 0.9
     boundary_cell_size: float = 0.05
     max_connections: int = 15
-    pruning_frequency: int = 6 
+    pruning_frequency: int = 6
     max_candidate_edge_distance: float = 0.5
     max_candidate_edge_search_distance: float = 10
 
@@ -55,11 +57,27 @@ class GlobalGraphGenerator:
 
     _colliding_edges: Set[Tuple[int, int]] = field(default_factory=set, init=False)
 
+    # --- Global graph stored as tensors (on GPU when available) ---
+    _global_pos: torch.Tensor = field(init=False)           # (N, 3) node positions
+    _global_ids: torch.Tensor = field(init=False)            # (N,)   node integer IDs
+    _global_node_types: torch.Tensor = field(init=False)     # (N,)   node type IDs (0=unknown, 1=free_space, 2=frontier)
+    _global_edge_ids: torch.Tensor = field(init=False)       # (E, 2) pairs of node IDs
+    _global_edge_weights: torch.Tensor = field(init=False)   # (E,)   edge weights
 
-    global_graph: nx.Graph = field(default_factory=nx.Graph, init=False)
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
     _boundary_probs: Dict[Tuple[int, int], float] = field(default_factory=dict, init=False)
+
+    # Node type encoding (matches graph_msg_utils)
+    _NODE_TYPE_ENCODE: Dict[str, int] = field(default_factory=lambda: {"": 0, "free_space": 1, "frontier": 2}, init=False, repr=False)
+
+    def __post_init__(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._global_pos = torch.empty((0, 3), dtype=torch.float32, device=device)
+        self._global_ids = torch.empty((0,), dtype=torch.long, device=device)
+        self._global_node_types = torch.empty((0,), dtype=torch.int32, device=device)
+        self._global_edge_ids = torch.empty((0, 2), dtype=torch.long, device=device)
+        self._global_edge_weights = torch.empty((0,), dtype=torch.float32, device=device)
 
     def _occ_origin(self):
         if self.occ_grid is None:
@@ -148,8 +166,6 @@ class GlobalGraphGenerator:
         )
         return _edge_valid_kernel
 
-
-
     def batch_collision_check(self, p1_xy, p2_xy, p1_ids, p2_ids):
 
         if self.occ_grid is None:
@@ -212,8 +228,6 @@ class GlobalGraphGenerator:
     def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid, resolution) -> None:
         """Merge a local graph into the persistent global graph with optimized vectorization."""
 
-        
-
         occ_grid = np.rot90(occ_grid, 2)  # To account for the occ grid convetion as per GridMap
         self.occ_center = (occ_center_x, occ_center_y)
         self.occ_grid = occ_grid
@@ -222,33 +236,22 @@ class GlobalGraphGenerator:
         if not 0.0 <= self.retention_factor <= 1.0:
             raise ValueError("retention_factor must be between 0 and 1")
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        global_ids = list(self.global_graph.nodes())
-        if global_ids:
-            global_pos = torch.tensor(
-                [self.global_graph.nodes[n]["world"][:2] for n in global_ids],
-                dtype=torch.float32,
-                device=device
-            )
-        else:
-            global_pos = torch.empty((0, 2), dtype=torch.float32, device=device)
+        device = self._global_pos.device
 
-        
+        global_pos = self._global_pos
+        global_ids_tensor = self._global_ids
 
         """
         ############# LOCAL NODE MERGING TO GLOBAL START ##################
         """
-            
-            
-        
         merge_start = torch.cuda.Event(enable_timing=True)
         merge_end = torch.cuda.Event(enable_timing=True)
         merge_start.record()
 
-        local_ids, self._next_node_id = self.tensor_merge_local_nodes(
+        local_ids, local_pos, self._next_node_id = self.tensor_merge_local_nodes(
             local_graph,
-            self.global_graph,
+            global_pos,
+            global_ids_tensor,
             self._next_node_id,
             self.merge_distance,
             device=device
@@ -257,16 +260,14 @@ class GlobalGraphGenerator:
         merge_end.record()
         torch.cuda.synchronize()
         local_merge_ms = merge_start.elapsed_time(merge_end)
-        
 
-        if not local_ids:
+        if local_ids.numel() == 0:
             return
-        
 
         """
         ############# LOCAL NODE MERGING TO GLOBAL END ##################
         """
-        
+
         """
         ############# CANDIDATE EDGE SELECTION START ##################
         """
@@ -274,46 +275,38 @@ class GlobalGraphGenerator:
         cand_start = torch.cuda.Event(enable_timing=True)
         cand_end = torch.cuda.Event(enable_timing=True)
         cand_start.record()
-        
-        local_pos = torch.tensor(
-            [self.global_graph.nodes[n]["world"][:2] for n in local_ids],
-            dtype=torch.float32,
-            device=device
-        )
-        
+
+        # Re-read global state after merge (new nodes may have been appended)
+        global_pos = self._global_pos
+        global_ids_tensor = self._global_ids
+
         # Compute centroid and filter candidates (all on GPU)
         centroid = local_pos.mean(dim=0)
         mask = torch.norm(global_pos - centroid, dim=1) < self.max_candidate_edge_search_distance
 
-        
         candidate_pos = global_pos[mask]
-        global_ids_tensor = torch.tensor(global_ids, device=device, dtype=torch.int64)
         candidate_ids_tensor = global_ids_tensor[mask]
-        
+
         if len(candidate_pos) == 0:
             return
-        
+
         dists = torch.cdist(local_pos, candidate_pos, p=2)
-        
+
         # Find connections within threshold
         valid_mask = dists < self.max_candidate_edge_distance
         local_idx, cand_idx = torch.nonzero(valid_mask, as_tuple=True)
 
-
-        
         if len(local_idx) == 0:
             return
-        
-        local_ids_tensor = torch.tensor(local_ids, device=device, dtype=torch.int64)
 
-        local_nodes_temp = local_ids_tensor[local_idx]
+        local_nodes_temp = local_ids[local_idx]
         global_nodes_temp = candidate_ids_tensor[cand_idx]
         no_self_loop_mask = local_nodes_temp != global_nodes_temp
 
         local_idx = local_idx[no_self_loop_mask]
         cand_idx = cand_idx[no_self_loop_mask]
-        
-        local_nodes = local_ids_tensor[local_idx]
+
+        local_nodes = local_ids[local_idx]
         global_nodes = candidate_ids_tensor[cand_idx]
         weights = dists[local_idx, cand_idx]
 
@@ -375,17 +368,16 @@ class GlobalGraphGenerator:
         """
         ############# ADDING EDGES TO THE GRAPH START ##################
         """
-        
+
         add_start = torch.cuda.Event(enable_timing=True)
         add_end = torch.cuda.Event(enable_timing=True)
         add_start.record()
 
-        edges = list(zip(
-            local_nodes.cpu().tolist(),
-            global_nodes.cpu().tolist(),
-            weights.cpu().tolist()
-        ))
-        self.global_graph.add_weighted_edges_from(edges)
+        if len(local_nodes) > 0:
+            new_edges = torch.stack([local_nodes, global_nodes], dim=1)  # (K, 2)
+            self._global_edge_ids = torch.cat([self._global_edge_ids, new_edges], dim=0)
+            self._global_edge_weights = torch.cat([self._global_edge_weights, weights], dim=0)
+            self._dedup_edges()
 
         add_end.record()
         torch.cuda.synchronize()
@@ -394,16 +386,18 @@ class GlobalGraphGenerator:
         """
         ############# ADDING EDGES TO THE GRAPH END ##################
         """
-        
+
         self._prune_redundant_edges()
 
 
-    def tensor_merge_local_nodes(self, local_graph, global_graph, next_node_id, merge_distance, device="cuda"):
+    def tensor_merge_local_nodes(self, local_graph, global_worlds: torch.Tensor, global_ids_tensor: torch.Tensor, next_node_id, merge_distance, device="cuda"):
         """
         Merge local graph nodes into global graph using fully vectorized GPU operations.
 
-        - Ignores node_type filtering and boundary logic (all nodes treated as free_space)
-        - Returns local_ids like the original loop
+        Returns (local_ids, local_id_positions, updated_next_id)
+          - local_ids:          (N,) long tensor of global node IDs assigned to each local node
+          - local_id_positions: (N, 3) positions (global pos for merged, local pos for new)
+          - updated_next_id:    int, next available node ID
         """
 
         # -------------------------
@@ -411,29 +405,22 @@ class GlobalGraphGenerator:
         # -------------------------
         local_nodes = list(local_graph.nodes())
         if len(local_nodes) == 0:
-            return [], next_node_id
+            return torch.empty((0,), dtype=torch.long, device=device), torch.empty((0, 3), dtype=torch.float32, device=device), next_node_id
 
+        encode = self._NODE_TYPE_ENCODE
         local_worlds = torch.tensor(
             [local_graph.nodes[n]["world"] for n in local_nodes],
             dtype=torch.float32,
             device=device
         )  # (N, D)
-        N = local_worlds.shape[0]
 
-        # -------------------------
-        # Extract global nodes
-        # -------------------------
-        global_nodes = list(global_graph.nodes())
-        if len(global_nodes) > 0:
-            global_worlds = torch.tensor(
-                [global_graph.nodes[n]["world"] for n in global_nodes],
-                dtype=torch.float32,
-                device=device
-            )  # (M, D)
-            global_ids_tensor = torch.tensor(global_nodes, dtype=torch.long, device=device)
-        else:
-            global_worlds = torch.empty((0, local_worlds.shape[1]), device=device)
-            global_ids_tensor = torch.empty((0,), dtype=torch.long, device=device)
+        local_types = torch.tensor(
+            [encode.get(local_graph.nodes[n].get("node_type", "free_space"), 1) for n in local_nodes],
+            dtype=torch.int32,
+            device=device
+        )  # (N,)
+
+        N = local_worlds.shape[0]
 
         # -------------------------
         # CASE 1: Empty global graph
@@ -443,6 +430,7 @@ class GlobalGraphGenerator:
             final_ids = new_ids
             new_local_mask = torch.ones(N, dtype=torch.bool, device=device)
             updated_next_id = next_node_id + N
+            local_id_positions = local_worlds
         else:
             # -------------------------
             # Compute pairwise distances
@@ -467,59 +455,139 @@ class GlobalGraphGenerator:
             final_ids[new_local_mask] = new_ids
             updated_next_id = next_node_id + num_new
 
-        # -------------------------
-        # Update global graph with new nodes
-        # -------------------------
-        for i, nid in enumerate(final_ids.cpu().tolist()):
-            if new_local_mask[i]:
-                world = local_worlds[i].cpu().tolist()
-                global_graph.add_node(nid, world=tuple(world), node_type=local_graph.nodes[local_nodes[i]]["node_type"], origin="new")
-            # Optional: mark usage _node_usage[nid] = 1.0
+            # Build positions: merged nodes use global position, new nodes use local position
+            local_id_positions = local_worlds.clone()
+            local_id_positions[~new_local_mask] = global_worlds[min_idx[~new_local_mask]]
+
+            # Update node types for merged nodes (local observation takes precedence)
+            if merge_mask.any():
+                self._global_node_types[min_idx[merge_mask]] = local_types[merge_mask]
 
         # -------------------------
-        # Return local_ids in same order as original loop
+        # Append new nodes to global tensor storage
         # -------------------------
-        local_ids = final_ids.cpu().tolist()
-        return local_ids, updated_next_id
+        if new_local_mask.any():
+            new_positions = local_worlds[new_local_mask]
+            new_types = local_types[new_local_mask]
+            self._global_pos = torch.cat([self._global_pos, new_positions], dim=0)
+            self._global_ids = torch.cat([self._global_ids, new_ids], dim=0)
+            self._global_node_types = torch.cat([self._global_node_types, new_types], dim=0)
+
+        return final_ids, local_id_positions, updated_next_id
 
     
 
+    def _dedup_edges(self) -> None:
+        """Remove duplicate edges, keeping the one with the smallest weight."""
+        if self._global_edge_ids.shape[0] == 0:
+            return
+
+        device = self._global_edge_ids.device
+
+        # Normalize direction: smaller ID first in each pair
+        sorted_pairs = torch.sort(self._global_edge_ids, dim=1)[0]  # (E, 2)
+
+        # Encode pairs as unique keys for grouping
+        unique_pairs, inverse = torch.unique(sorted_pairs, dim=0, return_inverse=True)
+
+        # For each unique edge, keep minimum weight
+        min_weights = torch.full((unique_pairs.shape[0],), float('inf'), dtype=torch.float32, device=device)
+        min_weights.scatter_reduce_(0, inverse, self._global_edge_weights, reduce='amin')
+
+        self._global_edge_ids = unique_pairs
+        self._global_edge_weights = min_weights
+
     def _prune_redundant_edges(self) -> None:
-        """Limit node degree by keeping only the closest neighbors."""
+        """Limit node degree by keeping only the closest neighbors.
+
+        Fully vectorized on GPU — no Python loops over nodes.
+        For each node, ranks its incident edges by weight and marks
+        edges beyond max_connections for removal.
+        """
         max_degree = self.max_connections
 
         # Only prune every N frames to reduce overhead
         if not hasattr(self, '_prune_counter'):
             self._prune_counter = 0
         self._prune_counter += 1
-        
-        # Only run every 10 frames (less frequent)
+
         if self._prune_counter % self.pruning_frequency != 0:
             return
-        
-        edges_to_remove = set()  # Use set to avoid duplicates
-        
-        for node in self.global_graph.nodes():
-            neighbors = list(self.global_graph.neighbors(node))
-            degree = len(neighbors)
-            
-            # Only prune if extremely over-connected
-            # print(degree)
-            if degree <= max_degree:
-                continue
-            
-            # Use list comprehension for efficiency
-            neighbor_weights = [(self.global_graph[node][neighbor]["weight"], neighbor) 
-                              for neighbor in neighbors]
-            
-            neighbor_weights.sort()  # Sort by distance (shortest first)
-            
-            # Keep only the max_degree closest neighbors
-            for weight, neighbor in neighbor_weights[max_degree:]:
-                edges_to_remove.add(tuple(sorted((node, neighbor))))
-        
-        # Batch remove edges
-        self.global_graph.remove_edges_from(edges_to_remove)
+
+        E = self._global_edge_ids.shape[0]
+        if E == 0:
+            return
+
+        device = self._global_edge_ids.device
+        edges = self._global_edge_ids   # (E, 2)
+        weights = self._global_edge_weights  # (E,)
+
+        # Consider both directions: edge i appears for both endpoints
+        all_nodes = torch.cat([edges[:, 0], edges[:, 1]])       # (2E,)
+        all_weights = weights.repeat(2)                          # (2E,)
+        all_edge_idx = torch.arange(E, device=device).repeat(2)  # (2E,)
+
+        # Map node IDs to compact 0..N-1 indices
+        unique_nodes, node_idx = torch.unique(all_nodes, return_inverse=True)  # node_idx: (2E,)
+        N = unique_nodes.shape[0]
+
+        # Compute degree per node
+        degree = torch.zeros(N, dtype=torch.long, device=device)
+        degree.scatter_add_(0, node_idx, torch.ones(2 * E, dtype=torch.long, device=device))
+
+        # Quick exit: if no node exceeds max_degree, nothing to prune
+        if (degree <= max_degree).all():
+            return
+
+        # For each (node, edge) pair, compute rank of the edge by weight within that node.
+        # Strategy: sort all entries by (node_idx, weight), then compute per-node rank.
+        sort_keys = node_idx.float() * (all_weights.max() + 1.0) + all_weights
+        sorted_order = torch.argsort(sort_keys)
+
+        sorted_node_idx = node_idx[sorted_order]
+
+        # Per-node rank: count how many entries with the same node_idx came before
+        ones = torch.ones(2 * E, dtype=torch.long, device=device)
+        cumcount = torch.zeros(2 * E, dtype=torch.long, device=device)
+        # Running count per node via scatter: shift by 1 to get 0-based rank
+        running = torch.zeros(N, dtype=torch.long, device=device)
+        # Vectorized cumcount: for each position in sorted order, rank = how many
+        # of the same node appeared before it
+        node_start = torch.zeros(N, dtype=torch.long, device=device)
+        node_start.scatter_add_(0, sorted_node_idx, ones)
+        # Compute exclusive cumsum per group using the sorted order
+        group_offsets = torch.zeros(2 * E, dtype=torch.long, device=device)
+        # The rank within each node group is just position - first_position_of_that_node
+        # Use cumsum trick: after sorting by (node, weight), consecutive same-node entries
+        # get ranks 0, 1, 2, ...
+        boundaries = torch.ones(2 * E, dtype=torch.long, device=device)
+        if 2 * E > 1:
+            same_as_prev = sorted_node_idx[1:] == sorted_node_idx[:-1]
+            boundaries[1:] = same_as_prev.long()
+        # cumsum within groups: reset at boundaries
+        # Simpler approach: cumcount per group = cumsum of ones, reset at group change
+        group_change = torch.ones(2 * E, dtype=torch.long, device=device)
+        group_change[0] = 1
+        if 2 * E > 1:
+            group_change[1:] = (~same_as_prev).long()
+        group_ids = torch.cumsum(group_change, dim=0) - 1  # 0-based group id for each sorted entry
+        pos_in_sort = torch.arange(2 * E, device=device)
+        group_starts = torch.zeros(group_ids[-1].item() + 1, dtype=torch.long, device=device)
+        group_starts.scatter_(0, group_ids, pos_in_sort)  # first occurrence per group
+        rank_in_node = pos_in_sort - group_starts[group_ids]  # 0-based rank within group
+
+        # Mark edges where rank >= max_degree for removal (from either endpoint)
+        exceeds = rank_in_node >= max_degree
+        edge_indices_to_remove = all_edge_idx[sorted_order[exceeds]]
+
+        if edge_indices_to_remove.shape[0] == 0:
+            return
+
+        edges_to_keep = torch.ones(E, dtype=torch.bool, device=device)
+        edges_to_keep[edge_indices_to_remove] = False
+
+        self._global_edge_ids = self._global_edge_ids[edges_to_keep]
+        self._global_edge_weights = self._global_edge_weights[edges_to_keep]
 
     def _decay_boundaries(self, seen: Set[Tuple[int, int]]) -> None:
         for key in list(self._boundary_probs.keys()):
@@ -539,9 +607,24 @@ class GlobalGraphGenerator:
 
     
 
-    def get_global_graph(self) -> nx.Graph:
-        """Return the stitched global graph."""
-        return self.global_graph
+    def get_global_graph(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the global graph as raw GPU tensors.
+
+        Returns:
+            (global_pos, global_ids, global_node_types, global_edge_ids, global_edge_weights)
+            - global_pos:          (N, 3)  float32 node positions
+            - global_ids:          (N,)    long    node integer IDs
+            - global_node_types:   (N,)    int32   node type IDs (0=unknown, 1=free_space, 2=frontier)
+            - global_edge_ids:     (E, 2)  long    edge endpoint pairs
+            - global_edge_weights: (E,)    float32 edge weights
+        """
+        return (
+            self._global_pos,
+            self._global_ids,
+            self._global_node_types,
+            self._global_edge_ids,
+            self._global_edge_weights,
+        )
 
     def boundary_probabilities(self) -> Dict[Tuple[int, int], float]:
         """Return the current obstacle probability map."""
@@ -550,25 +633,18 @@ class GlobalGraphGenerator:
     def debug_visualize(self, path: str, scale: float = 100.0) -> None:
         """Render a simple 2D visualization of the global graph."""
 
-        if len(self.global_graph) == 0:
+        num_nodes = self._global_ids.shape[0]
+        if num_nodes == 0:
             blank = np.zeros((512, 512, 3), dtype=np.uint8)
             cv2.imwrite(path, blank)
             return
 
-        xs, ys = [], []
-        for _, data in self.global_graph.nodes(data=True):
-            world = data.get("world")
-            if world is None:
-                continue
-            xs.append(float(world[0]))
-            ys.append(float(world[1]))
-        if not xs or not ys:
-            blank = np.zeros((512, 512, 3), dtype=np.uint8)
-            cv2.imwrite(path, blank)
-            return
+        pos_cpu = self._global_pos.cpu().numpy()  # (N, 3)
+        xs = pos_cpu[:, 0]
+        ys = pos_cpu[:, 1]
 
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
+        min_x, max_x = float(xs.min()), float(xs.max())
+        min_y, max_y = float(ys.min()), float(ys.max())
         width = max(64, int((max_x - min_x) * scale) + 64)
         height = max(64, int((max_y - min_y) * scale) + 64)
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
@@ -592,23 +668,25 @@ class GlobalGraphGenerator:
             canvas = cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0)
 
         # Draw edges
-        for u, v in self.global_graph.edges():
-            n1 = self.global_graph.nodes[u]
-            n2 = self.global_graph.nodes[v]
-            if "world" not in n1 or "world" not in n2:
-                continue
-            x1, y1 = to_px(float(n1["world"][0]), float(n1["world"][1]))
-            x2, y2 = to_px(float(n2["world"][0]), float(n2["world"][1]))
-            cv2.line(canvas, (x1, y1), (x2, y2), (0, 255, 255), 1)
+        if self._global_edge_ids.shape[0] > 0:
+            # Build ID → index map for position lookup
+            ids_cpu = self._global_ids.cpu().numpy()
+            id_to_idx = {int(nid): i for i, nid in enumerate(ids_cpu)}
+
+            edge_ids_cpu = self._global_edge_ids.cpu().numpy()
+            for u, v in edge_ids_cpu:
+                idx_u = id_to_idx.get(int(u))
+                idx_v = id_to_idx.get(int(v))
+                if idx_u is None or idx_v is None:
+                    continue
+                x1, y1 = to_px(float(pos_cpu[idx_u, 0]), float(pos_cpu[idx_u, 1]))
+                x2, y2 = to_px(float(pos_cpu[idx_v, 0]), float(pos_cpu[idx_v, 1]))
+                cv2.line(canvas, (x1, y1), (x2, y2), (0, 255, 255), 1)
 
         # Draw nodes
-        for _, data in self.global_graph.nodes(data=True):
-            world = data.get("world")
-            if world is None:
-                continue
-            x, y = to_px(float(world[0]), float(world[1]))
-            origin = str(data.get("origin", "new"))
-            color = (0, 0, 255) if origin == "known" else (255, 0, 0)
+        for i in range(num_nodes):
+            x, y = to_px(float(pos_cpu[i, 0]), float(pos_cpu[i, 1]))
+            color = (255, 0, 0)  # all nodes drawn as "new"
             cv2.circle(canvas, (x, y), 3, color, -1)
 
         cv2.imwrite(path, canvas)
