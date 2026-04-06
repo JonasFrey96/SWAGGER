@@ -116,6 +116,72 @@ class GlobalGraphGenerator:
         self._global_node_types = torch.cat([self._global_node_types, node_types])
 
         return new_ids
+    
+    def _remove_nodes(self, node_ids: torch.Tensor) -> None:
+        """
+        Remove nodes by their id, remove all the edges that are incident to and from them.
+        Also renumber everything such that it stays contigous.
+        NOTE: This is a design choice as it would require us to store a lookup table for node ids.
+        """
+        device = self._global_pos.device
+        
+        if node_ids is None or node_ids.numel() == 0:
+            return None
+
+        node_ids = node_ids.to(device)
+        invalid = ~torch.isin(node_ids, self._global_node_ids)      # length = len(node_ids)
+        
+        if invalid.any():
+            # a node_id ordered to be removed is not in the graph
+            bad_ids = node_ids[invalid].cpu().tolist()
+            raise ValueError(f"Node IDs not found in the graph : {bad_ids}")
+    
+        num_remaining_ids = self._global_node_ids.shape[0] - node_ids.shape[0]
+
+        if num_remaining_ids < 0:
+            raise ValueError(f"trying to remove{node_ids.shape[0]} but the graph only has {self._global_node_ids.shape[0]}")
+
+        ## Above are all possible error handling cases. 
+
+        remove_mask = torch.isin(self._global_node_ids, node_ids)
+        keep_mask = ~remove_mask
+
+        # First removing the nodes
+        self._global_pos = self._global_pos[keep_mask]
+        self._global_node_ids = self._global_node_ids[keep_mask]
+        self._global_node_types = self._global_node_types[keep_mask]
+
+        # removing the edges which were incident on the nodes to be removed
+        if self._global_edge_ids.shape[0] > 0:
+            src_dead = torch.isin(self._global_edge_ids[:, 0], node_ids)
+            dst_dead = torch.isin(self._global_edge_ids[:, 1], node_ids)
+
+            edge_keep = ~(src_dead | dst_dead)
+            self._global_edge_ids = self._global_edge_ids[edge_keep]
+            self._global_edge_weights = self._global_edge_weights[edge_keep]
+        
+        num_nodes_left_in_graph = self._global_pos.shape[0]
+
+        if num_nodes_left_in_graph == 0:
+            self._next_node_id = 0
+            return None
+    
+        ## Need to renumber the ids.
+        old_ids = self._global_node_ids                 # these won't be continously from 1 to N
+        new_ids = torch.arange(num_nodes_left_in_graph, dtype=torch.long, device=device)
+        # now old_ids say has [1, 2, 3, 6, 7, 10, 15] and the other nodes were removed
+        # new_ids would be [0, 1, 2, 3, 4, 5, 6] so we need to handle the edges in this manner as well
+        remap = torch.zeros(old_ids.max() + 1, dtype=torch.long, device=device)
+        remap[old_ids] = new_ids
+
+        self._global_node_ids = new_ids
+
+        if self._global_edge_ids.shape[0] > 0:
+            self._global_edge_ids[:, 0] = remap[self._global_edge_ids[:, 0]]
+            self._global_edge_ids[:, 1] = remap[self._global_edge_ids[:, 1]]
+
+        self._next_node_id = num_nodes_left_in_graph
+        return remap
 
     def _occ_origin(self):
         if self.occ_grid is None:
