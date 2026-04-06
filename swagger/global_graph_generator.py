@@ -59,7 +59,7 @@ class GlobalGraphGenerator:
 
     # --- Global graph stored as tensors (on GPU when available) ---
     _global_pos: torch.Tensor = field(init=False)           # (N, 3) node positions
-    _global_ids: torch.Tensor = field(init=False)            # (N,)   node integer IDs
+    _global_node_ids: torch.Tensor = field(init=False)            # (N,)   node integer IDs
     _global_node_types: torch.Tensor = field(init=False)     # (N,)   node type IDs (0=unknown, 1=free_space, 2=frontier)
     _global_edge_ids: torch.Tensor = field(init=False)       # (E, 2) pairs of node IDs
     _global_edge_weights: torch.Tensor = field(init=False)   # (E,)   edge weights
@@ -74,10 +74,48 @@ class GlobalGraphGenerator:
     def __post_init__(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._global_pos = torch.empty((0, 3), dtype=torch.float32, device=device)
-        self._global_ids = torch.empty((0,), dtype=torch.long, device=device)
+        self._global_node_ids = torch.empty((0,), dtype=torch.long, device=device)
         self._global_node_types = torch.empty((0,), dtype=torch.int32, device=device)
         self._global_edge_ids = torch.empty((0, 2), dtype=torch.long, device=device)
         self._global_edge_weights = torch.empty((0,), dtype=torch.float32, device=device)
+
+    def _add_node(self, position: torch.Tensor, node_type: int=1) -> int:
+        """
+        Adds a single node using the position (3,) and the specified node_type.
+        Returns the assigned node_id. 
+        """
+        device = self._global_pos.device
+        position = position.to(device)
+        node_id = self._next_node_id
+
+        self._global_pos = torch.cat([self._global_pos, position.unsqueeze(0)], dim=0)
+        self._global_node_ids = torch.cat([self._global_node_ids, torch.tensor([node_id], dtype=torch.long, device=device)])
+        self._global_node_types = torch.cat([self._global_node_types, torch.tensor([node_type], dtype=torch.long, device=device)])
+        self._next_node_id += 1 
+
+        return node_id
+    
+    def _add_nodes(self, positions: torch.Tensor, node_types: torch.tensor = None) -> torch.tensor:
+        """
+        Adding multiple nodes. Returns tensors of the assigned nodes.
+        positions : torch.tensor (num_new_nodes, 3)
+        """
+        device = self._global_pos.device
+        num_new_nodes = positions.shape[0]
+        positions = positions.to(device=device)
+        new_ids = torch.arange(self._next_node_id, self._next_node_id + num_new_nodes, dtype=torch.long, device=device)
+        self._next_node_id += num_new_nodes
+
+        if node_types is None:
+            # Assumed that if type not specified then it's free space.
+            encode = self._NODE_TYPE_ENCODE
+            node_types = torch.full((num_new_nodes, ), encode["free_space"], dtype=torch.long, device=device)
+        node_types = node_types.to(device)
+        self._global_pos = torch.cat([self._global_pos, positions], dim=0) 
+        self._global_node_ids = torch.cat([self._global_node_ids, new_ids])
+        self._global_node_types = torch.cat([self._global_node_types, node_types])
+
+        return new_ids
 
     def _occ_origin(self):
         if self.occ_grid is None:
@@ -223,8 +261,6 @@ class GlobalGraphGenerator:
         yq = int(world_xy[1] // resolution)
         return (xq, yq)
 
-
-
     def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid, resolution) -> None:
         """Merge a local graph into the persistent global graph with optimized vectorization."""
 
@@ -239,7 +275,7 @@ class GlobalGraphGenerator:
         device = self._global_pos.device
 
         global_pos = self._global_pos
-        global_ids_tensor = self._global_ids
+        global_ids_tensor = self._global_node_ids
 
         """
         ############# LOCAL NODE MERGING TO GLOBAL START ##################
@@ -278,7 +314,7 @@ class GlobalGraphGenerator:
 
         # Re-read global state after merge (new nodes may have been appended)
         global_pos = self._global_pos
-        global_ids_tensor = self._global_ids
+        global_ids_tensor = self._global_node_ids
 
         # Compute centroid and filter candidates (all on GPU)
         centroid = local_pos.mean(dim=0)
@@ -470,7 +506,7 @@ class GlobalGraphGenerator:
             new_positions = local_worlds[new_local_mask]
             new_types = local_types[new_local_mask]
             self._global_pos = torch.cat([self._global_pos, new_positions], dim=0)
-            self._global_ids = torch.cat([self._global_ids, new_ids], dim=0)
+            self._global_node_ids = torch.cat([self._global_node_ids, new_ids], dim=0)
             self._global_node_types = torch.cat([self._global_node_types, new_types], dim=0)
 
         return final_ids, local_id_positions, updated_next_id
@@ -620,7 +656,7 @@ class GlobalGraphGenerator:
         """
         return (
             self._global_pos,
-            self._global_ids,
+            self._global_node_ids,
             self._global_node_types,
             self._global_edge_ids,
             self._global_edge_weights,
@@ -633,7 +669,7 @@ class GlobalGraphGenerator:
     def debug_visualize(self, path: str, scale: float = 100.0) -> None:
         """Render a simple 2D visualization of the global graph."""
 
-        num_nodes = self._global_ids.shape[0]
+        num_nodes = self._global_node_ids.shape[0]
         if num_nodes == 0:
             blank = np.zeros((512, 512, 3), dtype=np.uint8)
             cv2.imwrite(path, blank)
@@ -670,7 +706,7 @@ class GlobalGraphGenerator:
         # Draw edges
         if self._global_edge_ids.shape[0] > 0:
             # Build ID → index map for position lookup
-            ids_cpu = self._global_ids.cpu().numpy()
+            ids_cpu = self._global_node_ids.cpu().numpy()
             id_to_idx = {int(nid): i for i, nid in enumerate(ids_cpu)}
 
             edge_ids_cpu = self._global_edge_ids.cpu().numpy()
