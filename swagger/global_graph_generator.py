@@ -183,6 +183,38 @@ class GlobalGraphGenerator:
         self._next_node_id = num_nodes_left_in_graph
         return remap
 
+    def _add_edge(self, src_id: int, dst_id: int, weight: float) -> None:
+        """
+        Add a single edge between node_src_id(src_id) and desired node_destination_id(dst_id) with positive weight (weight)
+        """
+        device = self._global_pos.device()
+
+        # error handling
+        find_src = torch.isin(
+            torch.tensor([src_id], dtype=torch.long, device=device),
+            self._global_node_ids
+        ).item()
+        if not find_src:
+             raise ValueError(f"source node{src_id} is not present in the graph")
+        
+        find_dst = torch.isin(
+            torch.tensor([dst_id], dtype=torch.long, device=device),
+            self._global_node_ids
+        ).item()
+        if not find_dst:
+            raise ValueError(f"destination node {dst_id} is not present in the graph")
+        
+        if src_id == dst_id:
+            raise ValueError(f"the source id {src_id} and the destination id {dst_id} are the same")
+        
+        new_edge = torch.tensor([src_id, dst_id], dtype=torch.long, device=device)
+        new_weight = torch.tensor([weight], dtype=torch.long, device=device)
+
+        self._global_edge_ids = torch.cat([self._global_edge_ids, new_edge], dim=0)
+        self._global_edge_weights = torch.cat([self._global_edge_weights, new_weight])
+
+        self._dedup_edges()
+
     def _occ_origin(self):
         if self.occ_grid is None:
             return (0.0, 0.0)
@@ -577,7 +609,6 @@ class GlobalGraphGenerator:
 
         return final_ids, local_id_positions, updated_next_id
 
-    
 
     def _dedup_edges(self) -> None:
         """Remove duplicate edges, keeping the one with the smallest weight."""
