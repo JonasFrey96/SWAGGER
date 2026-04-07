@@ -58,11 +58,14 @@ class GlobalGraphGenerator:
     _colliding_edges: Set[Tuple[int, int]] = field(default_factory=set, init=False)
 
     # --- Global graph stored as tensors (on GPU when available) ---
-    _global_pos: torch.Tensor = field(init=False)           # (N, 3) node positions
+    _global_pos: torch.Tensor = field(init=False)            # (N, 3) node positions
     _global_ids: torch.Tensor = field(init=False)            # (N,)   node integer IDs
     _global_node_types: torch.Tensor = field(init=False)     # (N,)   node type IDs (0=unknown, 1=free_space, 2=frontier)
     _global_edge_ids: torch.Tensor = field(init=False)       # (E, 2) pairs of node IDs
     _global_edge_weights: torch.Tensor = field(init=False)   # (E,)   edge weights
+
+    ## NOTE: THROUGHOUT THE CODE ENSURE THAT i-th NODE IN _global_pos CORRESPONDS TO i-th NODE ID in _global_ids
+    # SIMILARLY IN  _global_node_types, _global_edge_ids and _global_edge_weights.
 
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
@@ -228,7 +231,9 @@ class GlobalGraphGenerator:
     def add_local_graph(self, local_graph: nx.Graph, occ_center_x, occ_center_y, occ_grid, resolution) -> None:
         """Merge a local graph into the persistent global graph with optimized vectorization."""
 
-        occ_grid = np.rot90(occ_grid, 2)  # To account for the occ grid convetion as per GridMap
+        ## TODO: NEED GENERAL RULE ON HOW TO INPUT OCCUPANCY GRID MAP. THE CODE BELOW IS DUE TO OUR ELEVATION MAPPING OUTPUT.
+        occ_grid = np.rot90(occ_grid, 2)  # To account for the occ grid convention as per GridMap
+        
         self.occ_center = (occ_center_x, occ_center_y)
         self.occ_grid = occ_grid
         self.occ_resolution = resolution
@@ -282,6 +287,8 @@ class GlobalGraphGenerator:
 
         # Compute centroid and filter candidates (all on GPU)
         centroid = local_pos.mean(dim=0)
+
+        # Mask has the binary tensor for global nodes which are within the max edge search distance of the centroid of local points. 
         mask = torch.norm(global_pos - centroid, dim=1) < self.max_candidate_edge_search_distance
 
         candidate_pos = global_pos[mask]
@@ -295,12 +302,13 @@ class GlobalGraphGenerator:
         # Find connections within threshold
         valid_mask = dists < self.max_candidate_edge_distance
         local_idx, cand_idx = torch.nonzero(valid_mask, as_tuple=True)
+        # Edges are between local_idx[i] and cand_idx[i]
 
         if len(local_idx) == 0:
             return
 
-        local_nodes_temp = local_ids[local_idx]
-        global_nodes_temp = candidate_ids_tensor[cand_idx]
+        local_nodes_temp = local_ids[local_idx]                             # ID of the local_nodes forming edges
+        global_nodes_temp = candidate_ids_tensor[cand_idx]                  # ID of the global_nodes forming edges
         no_self_loop_mask = local_nodes_temp != global_nodes_temp
 
         local_idx = local_idx[no_self_loop_mask]
@@ -390,14 +398,21 @@ class GlobalGraphGenerator:
         self._prune_redundant_edges()
 
 
-    def tensor_merge_local_nodes(self, local_graph, global_worlds: torch.Tensor, global_ids_tensor: torch.Tensor, next_node_id, merge_distance, device="cuda"):
+    def tensor_merge_local_nodes(self, local_graph: nx.Graph, global_worlds: torch.Tensor, global_ids_tensor: torch.Tensor, next_node_id, merge_distance, device="cuda"):
         """
         Merge local graph nodes into global graph using fully vectorized GPU operations.
+        Args:
+            local_graph: The local NetworkX graph to merge (on CPU)
+            global_worlds: Tensor of existing global node positions. (on GPU)
+            global_ids_tensor: Tensor of existing global node IDs. (on GPU)
+            next_node_id: Next available unique node ID. (int)
+            merge_distance: Maximum distance for treating two nodes as the same. (int)
+            device: Torch device used for tensor allocation.
 
         Returns (local_ids, local_id_positions, updated_next_id)
-          - local_ids:          (N,) long tensor of global node IDs assigned to each local node
-          - local_id_positions: (N, 3) positions (global pos for merged, local pos for new)
-          - updated_next_id:    int, next available node ID
+          - local_ids:          (N,) long tensor of global node IDs assigned to each local node (on GPU)
+          - local_id_positions: (N, 3) positions (global pos for merged, local pos for new)     (on GPU)
+          - updated_next_id:    int, next available node ID                                     (int)
         """
 
         # -------------------------
