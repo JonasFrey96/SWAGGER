@@ -64,8 +64,8 @@ class GlobalGraphGenerator:
     _global_edge_ids: torch.Tensor = field(init=False)       # (E, 2) pairs of node IDs
     _global_edge_weights: torch.Tensor = field(init=False)   # (E,)   edge weights
 
-    ## NOTE: THROUGHOUT THE CODE ENSURE THAT i-th NODE IN _global_pos CORRESPONDS TO i-th NODE ID in _global_ids
-    # SIMILARLY IN  _global_node_types, _global_edge_ids and _global_edge_weights.
+    ## NOTE: THROUGHOUT THE CODE ENSURE THAT i-th NODE IN _global_pos CORRESPONDS TO i-th NODE ID in _global_ids and _global_node_types
+    # SIMILARLY _global_edge_ids and _global_edge_weights.
 
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
@@ -253,6 +253,7 @@ class GlobalGraphGenerator:
         merge_end = torch.cuda.Event(enable_timing=True)
         merge_start.record()
 
+        ## NOTE: local_ids: [old(self._next_node_id) : old(self._next_node_id) + number of nodes added]
         local_ids, local_pos, self._next_node_id = self.tensor_merge_local_nodes(
             local_graph,
             global_pos,
@@ -455,6 +456,7 @@ class GlobalGraphGenerator:
             # -------------------------
             # Find closest global for each local
             # -------------------------
+            # min_idx here is the 
             min_dists, min_idx = torch.min(dists, dim=1)
             merge_mask = min_dists < merge_distance    # (N,)
             merged_ids = global_ids_tensor[min_idx]    # (N,)
