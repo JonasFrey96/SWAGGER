@@ -187,6 +187,7 @@ class GlobalGraphGenerator:
         wx1 = p2_xy[:, 0]
         wy1 = p2_xy[:, 1]
 
+        # NOTE: world -> grid conversion
         gx0 = ((-wx0 + ox) / res).long()
         gy0 = ((+wy0 - oy) / res).long()
         gx1 = ((-wx1 + ox) / res).long()
@@ -197,6 +198,11 @@ class GlobalGraphGenerator:
         # -------------------------------
         # 2. TORCH → CUPY TRANSFER
         # -------------------------------
+        ## TODO: bug here, if the point in consideration is outside the grid of the cost map would lead to problems. 
+        # the kernel would identify the part of the edge inside the grid. BUT NEED TO CHECK THIS.
+        ## TODO: MAINTAIN A COSTMAP-LARGER THAN THE OEN BEING USED TO CHECK FOR COLLISIONS
+        # NOT SURE HOW TO ACCOUNT FOR STATE OBSERVATION ERRORS. 
+
         edges_cp = cp.asarray(edges_torch.to(torch.uint8).contiguous())
         grid_cp  = cp.asarray((self.occ_grid == 255).astype(np.uint8).flatten())
 
@@ -282,7 +288,7 @@ class GlobalGraphGenerator:
         cand_end = torch.cuda.Event(enable_timing=True)
         cand_start.record()
 
-        # Re-read global state after merge (new nodes may have been appended)
+        # Re-read global state after merge (new nodes may have been appended from the local graph)
         global_pos = self._global_pos
         global_ids_tensor = self._global_ids
 
@@ -310,7 +316,7 @@ class GlobalGraphGenerator:
 
         local_nodes_temp = local_ids[local_idx]                             # ID of the local_nodes forming edges
         global_nodes_temp = candidate_ids_tensor[cand_idx]                  # ID of the global_nodes forming edges
-        no_self_loop_mask = local_nodes_temp != global_nodes_temp
+        no_self_loop_mask = local_nodes_temp != global_nodes_temp           # prevents edges between new added nodes in global graph from the local graph
 
         local_idx = local_idx[no_self_loop_mask]
         cand_idx = cand_idx[no_self_loop_mask]
