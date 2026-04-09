@@ -103,14 +103,22 @@ class GlobalGraphGenerator:
 
     def _id_to_mask(self, node_ids: torch.Tensor) -> torch.Tensor:
         """Return a boolean mask over ``_global_ids`` for the requested IDs.
+        NOTE: If node_ids has Node IDs which do not exist in _global_ids then they would just be discarded. 
+        torch.sum(lookup[self._global_ids.long()]) might not be equal to node_ids.shape[0]
 
         Args:
-            node_ids: (K,) long tensor of node IDs to locate. **GPU.**
+            node_ids: (K,) long tensor of node IDs to locate. **Auto-assigns the tensor to the GPU**
 
         Returns:
             (N,) bool tensor on **GPU** — True where ``_global_ids`` matches.
         """
-        return (self._global_ids.unsqueeze(1) == node_ids.unsqueeze(0)).any(dim=1)
+        device = self._global_pos.device
+        node_ids = node_ids.to(device=device)
+        # Size lookup only to _global_ids.max() — queried IDs beyond that can't match
+        max_existing = self._global_ids.max() + 1
+        lookup = torch.zeros(max_existing, dtype=torch.bool, device=device)
+        lookup[node_ids[node_ids < max_existing].long()] = True
+        return lookup[self._global_ids.long()]
 
     # ── Single-node operations ──
 
@@ -260,18 +268,64 @@ class GlobalGraphGenerator:
         edge_pairs = edge_pairs.to(device)
         weights = weights.to(device)
 
-        # Validate: both endpoints must exist
+        # O(max_id) lookup instead of O(K*N) broadcast
         existing = self._global_ids  # (N,)
-        src_valid = (edge_pairs[:, 0].unsqueeze(1) == existing.unsqueeze(0)).any(dim=1)
-        tgt_valid = (edge_pairs[:, 1].unsqueeze(1) == existing.unsqueeze(0)).any(dim=1)
+        max_existing = existing.max() + 1
+        lookup = torch.zeros(max_existing, dtype=torch.bool, device=device)
+        lookup[existing] = True
+        # Any edge endpoint >= max_existing can't be a valid node
+        src_in_range = edge_pairs[:, 0] < max_existing
+        tgt_in_range = edge_pairs[:, 1] < max_existing
+        src_valid = src_in_range & lookup[edge_pairs[:, 0].clamp(max=max_existing - 1)]
+        tgt_valid = tgt_in_range & lookup[edge_pairs[:, 1].clamp(max=max_existing - 1)]
         valid = src_valid & tgt_valid
 
-        if valid.any():
+        if not valid.any():
+            return
+
+        new_pairs = edge_pairs[valid]
+        new_weights = weights[valid]
+
+        # ── Dedup: drop edges that already exist ──
+        if self._global_edge_ids.shape[0] > 0:
+            existing_sorted = torch.sort(self._global_edge_ids, dim=1)[0]  # (E, 2)
+            new_sorted = torch.sort(new_pairs, dim=1)[0]                   # (K', 2)
+            # Encode pairs as single ints for fast comparison
+            max_id_enc = max(existing_sorted.max(), new_sorted.max()) + 1
+            existing_keys = existing_sorted[:, 0] * max_id_enc + existing_sorted[:, 1]  # (E,)
+            new_keys = new_sorted[:, 0] * max_id_enc + new_sorted[:, 1]                 # (K',)
+            # O(max_key) lookup
+            key_lookup = torch.zeros(existing_keys.max() + 1, dtype=torch.bool, device=device)
+            key_lookup[existing_keys] = True
+            in_range = new_keys < key_lookup.shape[0]
+            already_exists = in_range & key_lookup[new_keys.clamp(max=key_lookup.shape[0] - 1)]
+            novel = ~already_exists
+            new_pairs = new_pairs[novel]
+            new_weights = new_weights[novel]
+
+        if new_pairs.shape[0] == 0:
+            return
+
+        # ── Degree check: drop edges that would exceed max_connections ──
+        # NOTE: degree is computed assuming all new edges are added at once, so mutual contention is not resolved greedily.
+        all_edges = torch.cat([self._global_edge_ids, new_pairs], dim=0)
+        all_nodes = torch.cat([all_edges[:, 0], all_edges[:, 1]])
+        max_node = all_nodes.max() + 1
+        degree = torch.zeros(max_node, dtype=torch.long, device=device)
+        degree.scatter_add_(0, all_nodes, torch.ones_like(all_nodes))
+        # For each new edge, check both endpoints' resulting degree
+        src_degree_ok = degree[new_pairs[:, 0]] <= self.max_connections
+        tgt_degree_ok = degree[new_pairs[:, 1]] <= self.max_connections
+        under_limit = src_degree_ok & tgt_degree_ok
+        new_pairs = new_pairs[under_limit]
+        new_weights = new_weights[under_limit]
+
+        if new_pairs.shape[0] > 0:
             self._global_edge_ids = torch.cat(
-                [self._global_edge_ids, edge_pairs[valid]], dim=0
+                [self._global_edge_ids, new_pairs], dim=0
             )
             self._global_edge_weights = torch.cat(
-                [self._global_edge_weights, weights[valid]], dim=0
+                [self._global_edge_weights, new_weights], dim=0
             )
 
     def remove_edges(self, edge_pairs: torch.Tensor) -> None:
