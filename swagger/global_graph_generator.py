@@ -66,6 +66,10 @@ class GlobalGraphGenerator:
 
     ## NOTE: THROUGHOUT THE CODE ENSURE THAT i-th NODE IN _global_pos CORRESPONDS TO i-th NODE ID in _global_ids and _global_node_types
     # SIMILARLY _global_edge_ids and _global_edge_weights.
+    #
+    # Node IDs are stable, non-contiguous, and monotonically assigned via
+    # _next_node_id.  IDs are never reused after removal.  Edge endpoints
+    # store node IDs (not array indices).
 
     _next_node_id: int = field(default=0, init=False)
     _node_usage: Dict[int, float] = field(default_factory=dict, init=False)
@@ -89,8 +93,215 @@ class GlobalGraphGenerator:
         h, w = self.occ_grid.shape
         ox = self.occ_center[0] + (w * self.occ_resolution) / 2.0
         oy = self.occ_center[1] - (h * self.occ_resolution) / 2.0
-        return (ox, oy)
+        return (ox, oy)        
 
+    # ------------------------------------------------------------------
+    # Primitive graph mutation API
+    # All node/edge mutations should go through these methods so that
+    # the parallel-array invariant is maintained in one place.
+    # ------------------------------------------------------------------
+
+    def _id_to_mask(self, node_ids: torch.Tensor) -> torch.Tensor:
+        """Return a boolean mask over ``_global_ids`` for the requested IDs.
+
+        Args:
+            node_ids: (K,) long tensor of node IDs to locate. **GPU.**
+
+        Returns:
+            (N,) bool tensor on **GPU** — True where ``_global_ids`` matches.
+        """
+        return (self._global_ids.unsqueeze(1) == node_ids.unsqueeze(0)).any(dim=1)
+
+    # ── Single-node operations ──
+
+    def add_node(self, position: torch.Tensor, node_type: int = 1) -> int:
+        """Add one node and return its new ID.
+
+        Args:
+            position:  (3,) float32 tensor. Can be **CPU or GPU** (moved
+                       automatically to match internal storage).
+            node_type: 0=unknown, 1=free_space (default), 2=frontier.
+
+        Returns:
+            int — the assigned node ID.  Internal tensors live on **GPU**.
+        """
+        nid = self._next_node_id
+        device = self._global_pos.device
+
+        self._global_pos = torch.cat(
+            [self._global_pos, position.to(device).unsqueeze(0)], dim=0
+        )
+        self._global_ids = torch.cat(
+            [self._global_ids, torch.tensor([nid], dtype=torch.long, device=device)]
+        )
+        self._global_node_types = torch.cat(
+            [self._global_node_types, torch.tensor([node_type], dtype=torch.int32, device=device)]
+        )
+        self._next_node_id += 1
+        return nid
+
+    def add_nodes(
+        self,
+        positions: torch.Tensor,
+        node_types: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Add multiple nodes and return their new IDs.
+
+        Args:
+            positions:  (K, 3) float32 tensor — world xyz.  Can be **CPU or
+                        GPU** (moved automatically).
+            node_types: (K,) int32 tensor — type per node.  Can be **CPU or
+                        GPU**.  If ``None``, every node defaults to
+                        ``1`` (free_space).
+
+        Returns:
+            (K,) long tensor of newly assigned node IDs on **GPU**.
+        """
+        K = positions.shape[0]
+        if K == 0:
+            return torch.empty((0,), dtype=torch.long, device=self._global_pos.device)
+
+        device = self._global_pos.device
+
+        if node_types is None:
+            node_types = torch.ones(K, dtype=torch.int32, device=device)
+
+        new_ids = torch.arange(
+            self._next_node_id, self._next_node_id + K,
+            dtype=torch.long, device=device,
+        )
+
+        self._global_pos = torch.cat([self._global_pos, positions.to(device)], dim=0)
+        self._global_ids = torch.cat([self._global_ids, new_ids], dim=0)
+        self._global_node_types = torch.cat(
+            [self._global_node_types, node_types.to(device).int()], dim=0
+        )
+        self._next_node_id += K
+        return new_ids
+
+    def remove_node(self, node_id: int) -> None:
+        """Remove a single node and all its incident edges.
+
+        Args:
+            node_id: integer ID of the node to remove.
+
+        Operates entirely on **GPU** tensors.
+        """
+        self.remove_nodes(
+            torch.tensor([node_id], dtype=torch.long, device=self._global_pos.device)
+        )
+
+    def remove_nodes(self, node_ids: torch.Tensor) -> None:
+        """Remove multiple nodes and every edge that references them.
+
+        Args:
+            node_ids: (K,) long tensor of node IDs to remove. Can be **CPU or
+                      GPU** (moved automatically).
+
+        Operates entirely on **GPU** tensors.
+        """
+        if node_ids.numel() == 0:
+            return
+
+        device = self._global_pos.device
+        node_ids = node_ids.to(device)
+
+        # ── Remove nodes ──
+        keep_mask = ~self._id_to_mask(node_ids)
+        self._global_pos = self._global_pos[keep_mask]
+        self._global_ids = self._global_ids[keep_mask]
+        self._global_node_types = self._global_node_types[keep_mask]
+
+        # ── Remove incident edges ──
+        if self._global_edge_ids.shape[0] > 0:
+            ids_set = node_ids.unsqueeze(0)                 # (1, K)
+            src = self._global_edge_ids[:, 0].unsqueeze(1)  # (E, 1)
+            tgt = self._global_edge_ids[:, 1].unsqueeze(1)  # (E, 1)
+            src_hit = (src == ids_set).any(dim=1)            # (E,)
+            tgt_hit = (tgt == ids_set).any(dim=1)            # (E,)
+            edge_keep = ~(src_hit | tgt_hit)
+            self._global_edge_ids = self._global_edge_ids[edge_keep]
+            self._global_edge_weights = self._global_edge_weights[edge_keep]
+
+    # ── Edge operations ──
+
+    def add_edge(self, src_id: int, tgt_id: int, weight: float) -> None:
+        """Add a single edge between two existing nodes.
+
+        Args:
+            src_id: source node ID.
+            tgt_id: target node ID.
+            weight: edge weight (e.g. Euclidean distance).
+
+        Silently drops the edge if either endpoint does not exist.
+        Operates on **GPU** tensors.
+        """
+        device = self._global_edge_ids.device
+        self.add_edges(
+            torch.tensor([[src_id, tgt_id]], dtype=torch.long, device=device),
+            torch.tensor([weight], dtype=torch.float32, device=device),
+        )
+
+    def add_edges(self, edge_pairs: torch.Tensor, weights: torch.Tensor) -> None:
+        """Add multiple edges, dropping any that reference non-existent nodes.
+
+        Args:
+            edge_pairs: (K, 2) long tensor — ``[src_id, tgt_id]`` per row.
+                        Can be **CPU or GPU** (moved automatically).
+            weights:    (K,) float32 tensor — one weight per edge.
+                        Can be **CPU or GPU** (moved automatically).
+
+        Internal tensors are updated on **GPU**.
+        """
+        if edge_pairs.shape[0] == 0:
+            return
+
+        device = self._global_edge_ids.device
+        edge_pairs = edge_pairs.to(device)
+        weights = weights.to(device)
+
+        # Validate: both endpoints must exist
+        existing = self._global_ids  # (N,)
+        src_valid = (edge_pairs[:, 0].unsqueeze(1) == existing.unsqueeze(0)).any(dim=1)
+        tgt_valid = (edge_pairs[:, 1].unsqueeze(1) == existing.unsqueeze(0)).any(dim=1)
+        valid = src_valid & tgt_valid
+
+        if valid.any():
+            self._global_edge_ids = torch.cat(
+                [self._global_edge_ids, edge_pairs[valid]], dim=0
+            )
+            self._global_edge_weights = torch.cat(
+                [self._global_edge_weights, weights[valid]], dim=0
+            )
+
+    def remove_edges(self, edge_pairs: torch.Tensor) -> None:
+        """Remove edges matching the given ``(src, tgt)`` pairs (order-independent).
+
+        Args:
+            edge_pairs: (K, 2) long tensor of edges to remove.  Can be **CPU
+                        or GPU** (moved automatically).  Direction is ignored
+                        — ``(a, b)`` matches ``(b, a)``.
+
+        Operates on **GPU** tensors.
+        """
+        if edge_pairs.shape[0] == 0 or self._global_edge_ids.shape[0] == 0:
+            return
+
+        device = self._global_edge_ids.device
+        edge_pairs = edge_pairs.to(device)
+
+        # Normalize both to (min, max) so direction doesn't matter
+        existing_sorted = torch.sort(self._global_edge_ids, dim=1)[0]  # (E, 2)
+        remove_sorted = torch.sort(edge_pairs, dim=1)[0]               # (K, 2)
+
+        # (E, 1, 2) == (1, K, 2) → all(dim=2) → any(dim=1) → (E,)
+        match = (
+            existing_sorted.unsqueeze(1) == remove_sorted.unsqueeze(0)
+        ).all(dim=2).any(dim=1)
+
+        keep = ~match
+        self._global_edge_ids = self._global_edge_ids[keep]
+        self._global_edge_weights = self._global_edge_weights[keep]
 
     def edge_valid_kernel(self, width, height):
         """
