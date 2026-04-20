@@ -356,6 +356,63 @@ class GlobalGraphGenerator:
         keep = ~match
         self._global_edge_ids = self._global_edge_ids[keep]
         self._global_edge_weights = self._global_edge_weights[keep]
+    
+    def return_closest_node_ids(self, query_node_positions: torch.Tensor, max_distance_graph: float = 10.0) -> torch.Tensor:
+        """
+        Returns the node_ids in self._global_ids which are closest to the position given in query_node_positions.
+
+        Args:
+            query_node_positions: (N, 3) float32 tensor stored as [x, y, z] can be **CPU or GPU**.
+            max_distance_graph: If a query's nearest node is at least this far (meters),
+                the returned ID for that query is -1.
+
+        Returns:
+            closest_node_ids: (N,) long tensor; entry is -1 when no node is within
+                max_distance_graph.
+
+        Note:
+            torch.cdist produces an (N, M) float32 matrix (M = num global nodes).
+            For large N this can exhaust VRAM, so the query is chunked based on
+            available CUDA memory (1 GB safety buffer, capped at 8 GB budget).
+        """
+        device = self._global_pos.device
+
+        if self._global_pos.shape[0] == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+        if query_node_positions.shape[0] == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        query_node_positions = query_node_positions.to(device)
+        N = query_node_positions.shape[0]
+        M = self._global_pos.shape[0]
+        bytes_per_row = M * 4  # cdist output is float32
+
+        if device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            budget_bytes = max(0, free_bytes - 1 * 1024**3)   # leave 1 GB headroom
+            budget_bytes = min(budget_bytes, 8 * 1024**3)     # hard cap at 8 GB
+        else:
+            budget_bytes = 8 * 1024**3
+        chunk_size = max(1, budget_bytes // bytes_per_row)
+
+        if N <= chunk_size:
+            dists = torch.cdist(query_node_positions, self._global_pos)  # (N, M)
+            min_dist, index = torch.min(dists, dim=1)
+        else:
+            min_dist_parts, index_parts = [], []
+            for start in range(0, N, chunk_size):
+                chunk = query_node_positions[start:start + chunk_size]
+                d = torch.cdist(chunk, self._global_pos)                 # (chunk, M)
+                md, idx = torch.min(d, dim=1)
+                min_dist_parts.append(md)
+                index_parts.append(idx)
+            min_dist = torch.cat(min_dist_parts)
+            index = torch.cat(index_parts)
+
+        far_off_points = min_dist >= max_distance_graph
+        closest_ids = self._global_ids[index]
+        closest_ids[far_off_points] = -1
+        return closest_ids
 
     def edge_valid_kernel(self, width, height):
         """
