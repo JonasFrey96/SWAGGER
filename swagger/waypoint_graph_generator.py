@@ -365,7 +365,7 @@ class WaypointGraphGenerator:
 
     def _find_obstacle_contours(self, boundary_inflation: float) -> list[np.ndarray]:
         """Find contours of inflated obstacles using the distance map."""
-        filtered_obstacles = (self._dist_transform >= boundary_inflation).astype(np.uint8)
+        filtered_obstacles = (self._dist_transform >= boundary_inflation).astype(np.uint8)              # regions of space which are safe from obstacles
         contours, _ = cv2.findContours(filtered_obstacles, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
         return contours
 

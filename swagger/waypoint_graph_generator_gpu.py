@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import cupy as cp
 import cupyx.scipy.ndimage as cp_ndi
+import numpy as np
 import torch
-
 
 @dataclass
 class WaypointGraphGeneratorConfig:
@@ -12,15 +12,21 @@ class WaypointGraphGeneratorConfig:
 
     All distance parameters are in meters; pixel conversions happen internally.
     """
-    boundary_inflation_factor: float = 1.5      # multiplier on safety_distance for obstacle dilation
-    boundary_sample_distance: float = 2.5       # stride between boundary samples (m)
-    free_space_sampling_threshold: float = 1.5  # max allowed dist-to-node for any free pixel (m)
+    boundary_inflation_factor: float = 1.1      # multiplier on safety_distance for obstacle dilation
+    boundary_sample_distance: float = 0.4       # stride between boundary samples (m)
+    free_space_sampling_threshold: float = 0.4  # max allowed dist-to-node for any free pixel (m)
 
     merge_node_distance: float = 0.25           # merge nodes closer than this (m)
 
     use_boundary_sampling: bool = True
     use_free_space_sampling: bool = True
     prune_graph: bool = True
+
+    # When True, boundary nodes are placed by tracing each wall contour on CPU
+    # (via connected-component labelling + greedy nearest-neighbour walk) and
+    # sampling every boundary_sample_distance metres along the arc.
+    # When False (default), a faster pure-GPU random subsample is used instead.
+    structured_boundary_sampling: bool = False
 
     def __post_init__(self):
         for name in (
@@ -115,6 +121,12 @@ class WaypointGraphGeneratorGPU:
         free_map = self._binarize(image, occupancy_threshold)  # cupy uint8
 
         # ----------------------------------------------------------------
+        # Trivial case: completely free map → uniform grid
+        # ----------------------------------------------------------------
+        if bool(free_map.all()):
+            return self._create_grid_graph(device)
+
+        # ----------------------------------------------------------------
         # Step 2: distance transform + inflate obstacles
         # ----------------------------------------------------------------
         self._compute_distance_and_inflation(free_map)
@@ -122,6 +134,7 @@ class WaypointGraphGeneratorGPU:
         # ----------------------------------------------------------------
         # Step 3 + 4: sample boundary waypoints
         # ----------------------------------------------------------------
+        # pixel coordinates of the free space
         pixel_rows = []
         pixel_cols = []
 
@@ -165,6 +178,26 @@ class WaypointGraphGeneratorGPU:
         return pos, node_types
 
     # ------------------------------------------------------------------
+    # Trivial case — uniform grid for fully free maps
+    # ------------------------------------------------------------------
+
+    def _create_grid_graph(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a regular grid of waypoints with a safety-distance margin from the border."""
+        H, W = self._H, self._W
+        margin = int(self._safety_distance / self._resolution)
+        step = max(1, int(self._config.free_space_sampling_threshold / self._resolution))
+
+        rows = torch.arange(margin, H - margin, step, dtype=torch.float32)
+        cols = torch.arange(margin, W - margin, step, dtype=torch.float32)
+        grid_rows, grid_cols = torch.meshgrid(rows, cols, indexing="ij")
+        r = grid_rows.reshape(-1)
+        c = grid_cols.reshape(-1)
+
+        pos = self._pixels_to_world_tensor(cp.asarray(r), cp.asarray(c), device)
+        node_types = torch.ones(pos.shape[0], dtype=torch.int32, device=device)
+        return pos, node_types
+
+    # ------------------------------------------------------------------
     # Step 1 — binarize
     # ------------------------------------------------------------------
 
@@ -185,14 +218,13 @@ class WaypointGraphGeneratorGPU:
     def _compute_distance_and_inflation(self, free_map: cp.ndarray):
         """Compute per-pixel L2 distance to nearest obstacle and the inflated mask."""
         # pad border with zeros (obstacle) so the EDT reflects map boundary as obstacle
-        padded = cp.pad(free_map, 1, mode="constant", constant_values=0)
-        dist = cp_ndi.distance_transform_edt(padded).astype(cp.float32)
+        padded = cp.pad(free_map, 1, mode="constant", constant_values=0)        # (H+2. W+2)
+        dist = cp_ndi.distance_transform_edt(padded).astype(cp.float32)         # (H+2, W+2)
         self._dist_transform = dist[1:-1, 1:-1]  # strip pad
+        # self._dist_transform has the distance to each obstacle
 
         inflation_px = (
-            self._config.boundary_inflation_factor
-            * self._safety_distance
-            / self._resolution
+            self._config.boundary_inflation_factor * self._safety_distance / self._resolution
         )
         self._inflated_map = (self._dist_transform < inflation_px).astype(cp.uint8)
 
@@ -203,32 +235,146 @@ class WaypointGraphGeneratorGPU:
     def _sample_boundary_nodes(self) -> tuple[cp.ndarray, cp.ndarray]:
         """Sample waypoints along the boundary of the inflation zone.
 
-        The boundary is defined as pixels that are free but directly adjacent
-        to the inflated zone — i.e., pixels just outside the safety bubble.
-        We detect them with morphological dilation and then subsample at
-        `boundary_sample_distance` / resolution stride.
+        The boundary is the one-pixel ring of safe-free pixels that directly
+        border the inflated obstacle zone, found via morphological erosion.
+
+        Dispatches to one of two strategies based on config.structured_boundary_sampling:
+          False (default) — pure GPU: random subsample at the requested stride.
+          True            — CPU-assisted: label connected components, trace each
+                            contour in arc-length order, sample every
+                            boundary_sample_distance metres along the path.
         """
         inflation_px = (
-            self._config.boundary_inflation_factor
-            * self._safety_distance
-            / self._resolution
+            self._config.boundary_inflation_factor * self._safety_distance / self._resolution
         )
-        # Pixels with dist >= inflation_px are safely free (not inflated)
         safe_free = (self._dist_transform >= inflation_px).astype(cp.uint8)
 
-        # Boundary = safe_free pixels that touch the inflated zone.
-        # Equivalent to: erode(safe_free) XOR safe_free  (border of the safe region).
         struct = cp.ones((3, 3), dtype=cp.uint8)
         eroded = cp_ndi.binary_erosion(safe_free, structure=struct).astype(cp.uint8)
         boundary_mask = safe_free - eroded  # 1 only on boundary pixels
 
-        boundary_coords = cp.argwhere(boundary_mask)  # (M, 2): (row, col)
-        if boundary_coords.shape[0] == 0:
+        if int(boundary_mask.sum()) == 0:
             return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
 
-        stride = max(1, int(self._config.boundary_sample_distance / self._resolution))
-        sampled = boundary_coords[::stride]
-        return sampled[:, 0].astype(cp.int32), sampled[:, 1].astype(cp.int32)
+        if self._config.structured_boundary_sampling:
+            return self._sample_boundary_structured(boundary_mask)
+        return self._sample_boundary_random(boundary_mask)
+
+    def _sample_boundary_random(
+        self, boundary_mask: cp.ndarray
+    ) -> tuple[cp.ndarray, cp.ndarray]:
+        """Pure-GPU path: random subsample of boundary pixels, then greedy spacing filter.
+
+        Random choice provides variety across calls; the greedy post-filter ensures
+        no two kept nodes are closer than max(boundary_sample_distance, merge_node_distance)
+        so the prune step won't discard any boundary nodes.
+        """
+        boundary_coords = cp.argwhere(boundary_mask)  # (M, 2)
+        stride = max(1, int(self._config.boundary_sample_distance / (self._resolution * 2)))
+        indices = cp.random.choice(
+            boundary_coords.shape[0],
+            size=max(1, boundary_coords.shape[0] // stride),
+            replace=False,
+        )
+        sampled = boundary_coords[indices]
+        rows, cols = sampled[:, 0].astype(cp.int32), sampled[:, 1].astype(cp.int32)
+
+        # Post-filter: drop nodes closer than max(bsd, merge) so nothing is wasted by pruning.
+        min_spacing_px = max(
+            self._config.boundary_sample_distance / self._resolution,
+            self._config.merge_node_distance / self._resolution,
+        )
+        return self._greedy_subsample(rows, cols, min_spacing_px)
+
+    def _sample_boundary_structured(
+        self, boundary_mask: cp.ndarray
+    ) -> tuple[cp.ndarray, cp.ndarray]:
+        """CPU-assisted path: label contours, trace each in arc-length order, then sample.
+
+        Each 8-connected component of the boundary (one per wall segment or obstacle
+        outline) is traced independently.  This guarantees that samples are evenly
+        spaced along the actual curve rather than randomly distributed.
+        """
+        labeled_cp, num_features = cp_ndi.label(
+            boundary_mask, structure=cp.ones((3, 3), dtype=cp.int32)
+        )
+        labeled_np = cp.asnumpy(labeled_cp).astype(np.int32)
+
+        step_px = max(1, int(self._config.boundary_sample_distance / self._resolution))
+
+        sampled_rows: list[int] = []
+        sampled_cols: list[int] = []
+
+        for comp_id in range(1, num_features + 1):
+            coords = np.argwhere(labeled_np == comp_id)  # (K, 2) row/col
+            if coords.shape[0] == 0:
+                continue
+            ordered = self._trace_boundary_walk(coords)
+            for i in range(0, ordered.shape[0], step_px):
+                sampled_rows.append(int(ordered[i, 0]))
+                sampled_cols.append(int(ordered[i, 1]))
+
+        if not sampled_rows:
+            return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+
+        return (
+            cp.array(sampled_rows, dtype=cp.int32),
+            cp.array(sampled_cols, dtype=cp.int32),
+        )
+
+    @staticmethod
+    def _trace_boundary_walk(coords: np.ndarray) -> np.ndarray:
+        """Order boundary pixels by arc-length via a greedy nearest-neighbour walk.
+
+        Builds a cKDTree over the component's pixels and repeatedly moves to the
+        nearest unvisited neighbour.  For a thin (1-px wide) contour this is
+        identical to walking the curve; for thick regions it still produces a
+        compact, low-backtrack path.
+
+        Args:
+            coords: (K, 2) int array of (row, col) pixel positions.
+
+        Returns:
+            (K, 2) int array of the same pixels reordered by arc-length.
+        """
+        from scipy.spatial import cKDTree
+
+        if coords.shape[0] <= 2:
+            return coords
+
+        n = coords.shape[0]
+        tree = cKDTree(coords)
+        visited = np.zeros(n, dtype=bool)
+
+        # Topmost-then-leftmost pixel — deterministic start regardless of argwhere order.
+        start_idx = int(np.lexsort((coords[:, 1], coords[:, 0]))[0])
+        order = [start_idx]
+        visited[start_idx] = True
+        curr = coords[start_idx]
+
+        k = min(12, n)  # query k neighbours; handles thick boundaries with visited neighbours
+
+        for _ in range(n - 1):
+            _, idxs = tree.query(curr, k=k)
+            moved = False
+            for i in idxs:
+                if not visited[i]:
+                    order.append(int(i))
+                    visited[i] = True
+                    curr = coords[i]
+                    moved = True
+                    break
+            if not moved:
+                # All k-NN are visited — jump to global nearest unvisited pixel.
+                # This handles disconnected islands within a component (rare but possible).
+                dists = np.sum((coords - curr) ** 2, axis=1).astype(np.float64)
+                dists[visited] = np.inf
+                next_i = int(np.argmin(dists))
+                order.append(next_i)
+                visited[next_i] = True
+                curr = coords[next_i]
+
+        return coords[np.array(order, dtype=np.int32)]
 
     # ------------------------------------------------------------------
     # Step 5 — free-space sampling
@@ -241,24 +387,30 @@ class WaypointGraphGeneratorGPU:
     ) -> tuple[cp.ndarray, cp.ndarray]:
         """Iteratively place interior waypoints so every free pixel is covered.
 
-        Uses the same logic as the CPU version:
-          1. Compute distance transform of the "not yet covered" free mask.
-          2. Find local maxima (pixels whose distance equals the 3×3 neighborhood max).
-          3. Keep maxima that are still uncovered and far enough from existing nodes.
-          4. Mark a disk around each accepted node as covered.
-          5. Repeat until max uncovered distance ≤ threshold.
+        Mirrors the CPU version exactly:
+          1. EDT on blocked mask where 0 = obstacle/covered, 1 = uncovered free.
+          2. Local maxima with dist > threshold_px are the best candidate sites.
+          3. Greedily accept candidates spaced ≥ half_t apart.
+          4. Mark accepted node PIXELS (not disks) as covered — so EDT in the
+             next iteration measures true distance-to-nearest-node.
+          5. Repeat until max(EDT) ≤ threshold_px, meaning every free pixel is
+             within threshold_px of a node.
         """
         threshold_px = self._config.free_space_sampling_threshold / self._resolution
         half_t = threshold_px / 2.0
+        # Ensure placed nodes are never closer than merge_node_distance so the
+        # prune step doesn't immediately discard free-space nodes.
+        merge_px  = self._config.merge_node_distance / self._resolution
+        min_spacing = max(half_t, merge_px)
 
         # blocked_mask: 1=free and uncovered, 0=covered or obstacle
-        blocked = (self._inflated_map == 0).astype(cp.uint8)  # start: all non-inflated free
+        blocked = (self._inflated_map == 0).astype(cp.uint8)
 
-        # mark existing nodes as covered
+        # mark existing nodes as single pixels so EDT = distance-to-nearest-node
         if existing_rows:
             all_rows = cp.concatenate(existing_rows).astype(cp.int32)
             all_cols = cp.concatenate(existing_cols).astype(cp.int32)
-            self._mark_disk(blocked, all_rows, all_cols, half_t)
+            blocked[all_rows, all_cols] = 0
 
         struct3 = cp.ones((3, 3), dtype=cp.float32)
         max_iters = 12
@@ -286,9 +438,8 @@ class WaypointGraphGeneratorGPU:
                     break
                 continue
 
-            # greedily accept maxima that are far enough from already-accepted ones
             accepted_rows, accepted_cols = self._greedy_subsample(
-                coords[:, 0], coords[:, 1], blocked, half_t
+                coords[:, 0], coords[:, 1], min_spacing
             )
 
             if accepted_rows.shape[0] == 0:
@@ -300,7 +451,8 @@ class WaypointGraphGeneratorGPU:
             stall_iters = 0
             new_rows_list.append(accepted_rows)
             new_cols_list.append(accepted_cols)
-            self._mark_disk(blocked, accepted_rows, accepted_cols, half_t)
+            # mark only the node pixels — keeps EDT = true distance-to-nearest-node
+            blocked[accepted_rows, accepted_cols] = 0
 
         if not new_rows_list:
             return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
@@ -310,47 +462,30 @@ class WaypointGraphGeneratorGPU:
             cp.concatenate(new_cols_list).astype(cp.int32),
         )
 
+    @staticmethod
     def _greedy_subsample(
-        self,
         rows: cp.ndarray,
         cols: cp.ndarray,
-        blocked: cp.ndarray,
         min_spacing: float,
     ) -> tuple[cp.ndarray, cp.ndarray]:
-        """Accept candidates sequentially, skipping those too close to an accepted node.
+        """Accept candidates in order, rejecting any within min_spacing of an accepted node.
 
-        Uses a grid-based blocking mask (same idea as the R-tree in the CPU version)
-        rather than a spatial index — each accepted node marks a square tile as used.
+        Matches the CPU version's R-tree half_threshold radius check. Runs on CPU
+        because the candidate set K is small (local maxima after EDT, typically < 200).
         """
-        # work on CPU for the sequential acceptance loop (small K after maxima detection)
-        rows_np = cp.asnumpy(rows)
-        cols_np = cp.asnumpy(cols)
-        H, W = blocked.shape
-
-        cell = max(1, int(min_spacing))
-        # grid of accepted cells; True means "already claimed"
-        grid_h = H // cell + 1
-        grid_w = W // cell + 1
-        grid = [[False] * grid_w for _ in range(grid_h)]
+        rows_np = cp.asnumpy(rows).astype(int)
+        cols_np = cp.asnumpy(cols).astype(int)
+        min_sq = min_spacing * min_spacing
 
         accepted_r: list[int] = []
         accepted_c: list[int] = []
 
         for r, c in zip(rows_np.tolist(), cols_np.tolist()):
-            r, c = int(r), int(c)
-            gr, gc = r // cell, c // cell
-            # check 3×3 neighborhood of cells
-            conflict = False
-            for dr in range(-1, 2):
-                for dc in range(-1, 2):
-                    ngr, ngc = gr + dr, gc + dc
-                    if 0 <= ngr < grid_h and 0 <= ngc < grid_w and grid[ngr][ngc]:
-                        conflict = True
-                        break
-                if conflict:
-                    break
-            if not conflict:
-                grid[gr][gc] = True
+            close = any(
+                (r - ar) * (r - ar) + (c - ac) * (c - ac) < min_sq
+                for ar, ac in zip(accepted_r, accepted_c)
+            )
+            if not close:
                 accepted_r.append(r)
                 accepted_c.append(c)
 
@@ -361,20 +496,6 @@ class WaypointGraphGeneratorGPU:
             cp.array(accepted_r, dtype=cp.int32),
             cp.array(accepted_c, dtype=cp.int32),
         )
-
-    @staticmethod
-    def _mark_disk(mask: cp.ndarray, rows: cp.ndarray, cols: cp.ndarray, radius: float):
-        """Zero out a square of side 2*radius around each (row, col) in mask."""
-        if rows.shape[0] == 0:
-            return
-        H, W = mask.shape
-        r = int(math.ceil(radius))
-        rows_np = cp.asnumpy(rows).astype(int)
-        cols_np = cp.asnumpy(cols).astype(int)
-        for row, col in zip(rows_np.tolist(), cols_np.tolist()):
-            r0, r1 = max(0, row - r), min(H, row + r + 1)
-            c0, c1 = max(0, col - r), min(W, col + r + 1)
-            mask[r0:r1, c0:c1] = 0
 
     # ------------------------------------------------------------------
     # Step 6 — remove inflated nodes
