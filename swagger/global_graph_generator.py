@@ -727,6 +727,94 @@ class GlobalGraphGenerator:
         self._prune_redundant_edges()
 
 
+    def add_local_graph_gpu(
+        self,
+        local_pos: torch.Tensor,           # (N, 3) float32 CUDA — world XYZ
+        local_node_types: torch.Tensor,    # (N,)   int32  CUDA — 1=free_space
+        occ_center_x: float,
+        occ_center_y: float,
+        occ_grid,                          # numpy occupancy grid (same convention as add_local_graph)
+        resolution: float,
+    ) -> None:
+        """Tensor-native equivalent of add_local_graph.
+
+        Accepts node positions and types directly as CUDA tensors (the exact
+        output of WaypointGraphGeneratorGPU.build_graph_from_grid_map) instead
+        of a NetworkX graph, skipping the per-node Python extraction loop.
+
+        All other behaviour — merging, edge candidate selection, collision
+        filtering, deduplication, pruning — is identical to add_local_graph.
+        """
+        occ_grid = np.rot90(occ_grid, 2)
+        self.occ_center = (occ_center_x, occ_center_y)
+        self.occ_grid = occ_grid
+        self.occ_resolution = resolution
+
+        if not 0.0 <= self.retention_factor <= 1.0:
+            raise ValueError("retention_factor must be between 0 and 1")
+
+        device = self._global_pos.device
+
+        local_ids, local_id_positions, self._next_node_id = self.tensor_merge_local_nodes_gpu(
+            local_pos,
+            local_node_types,
+            self._global_pos,
+            self._global_ids,
+            self._next_node_id,
+            self.merge_distance,
+            device=device,
+        )
+
+        if local_ids.numel() == 0:
+            return
+
+        # Re-read global state after merge (new nodes may have been appended).
+        global_pos = self._global_pos
+        global_ids_tensor = self._global_ids
+
+        centroid = local_id_positions.mean(dim=0)
+        mask = torch.norm(global_pos - centroid, dim=1) < self.max_candidate_edge_search_distance
+        candidate_pos = global_pos[mask]
+        candidate_ids_tensor = global_ids_tensor[mask]
+
+        if len(candidate_pos) == 0:
+            return
+
+        dists = torch.cdist(local_id_positions, candidate_pos, p=2)
+        valid_mask = dists < self.max_candidate_edge_distance
+        local_idx, cand_idx = torch.nonzero(valid_mask, as_tuple=True)
+
+        if len(local_idx) == 0:
+            return
+
+        local_nodes_temp = local_ids[local_idx]
+        global_nodes_temp = candidate_ids_tensor[cand_idx]
+        no_self_loop_mask = local_nodes_temp != global_nodes_temp
+
+        local_idx  = local_idx[no_self_loop_mask]
+        cand_idx   = cand_idx[no_self_loop_mask]
+        local_nodes  = local_ids[local_idx]
+        global_nodes = candidate_ids_tensor[cand_idx]
+        weights      = dists[local_idx, cand_idx]
+
+        p1 = local_id_positions[local_idx]
+        p2 = candidate_pos[cand_idx]
+
+        collision_free_mask = self.batch_collision_check(p1, p2, local_nodes, global_nodes)
+
+        local_nodes  = local_nodes[collision_free_mask]
+        global_nodes = global_nodes[collision_free_mask]
+        weights      = weights[collision_free_mask]
+
+        if len(local_nodes) > 0:
+            new_edges = torch.stack([local_nodes, global_nodes], dim=1)
+            self._global_edge_ids    = torch.cat([self._global_edge_ids, new_edges], dim=0)
+            self._global_edge_weights = torch.cat([self._global_edge_weights, weights], dim=0)
+            self._dedup_edges()
+
+        self._prune_redundant_edges()
+
+
     def tensor_merge_local_nodes(self, local_graph: nx.Graph, global_worlds: torch.Tensor, global_ids_tensor: torch.Tensor, next_node_id, merge_distance, device="cuda"):
         """
         Merge local graph nodes into global graph using fully vectorized GPU operations.
@@ -820,7 +908,72 @@ class GlobalGraphGenerator:
 
         return final_ids, local_id_positions, updated_next_id
 
-    
+
+    def tensor_merge_local_nodes_gpu(
+        self,
+        local_worlds: torch.Tensor,       # (N, 3) float32 CUDA — world XYZ
+        local_types: torch.Tensor,        # (N,)   int32  CUDA — node type IDs
+        global_worlds: torch.Tensor,
+        global_ids_tensor: torch.Tensor,
+        next_node_id: int,
+        merge_distance: float,
+        device: str = "cuda",
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Tensor-native equivalent of tensor_merge_local_nodes.
+
+        Identical merge logic but accepts positions and types as CUDA tensors
+        directly, avoiding the per-node Python extraction from a NetworkX graph.
+
+        Returns:
+            local_ids:          (N,) long tensor — global ID assigned to each local node.
+            local_id_positions: (N, 3) float32  — global pos for merged nodes, local pos for new.
+            updated_next_id:    int — next available node ID.
+        """
+        N = local_worlds.shape[0]
+
+        if N == 0:
+            return (
+                torch.empty((0,), dtype=torch.long, device=device),
+                torch.empty((0, 3), dtype=torch.float32, device=device),
+                next_node_id,
+            )
+
+        if global_worlds.numel() == 0:
+            new_ids = torch.arange(next_node_id, next_node_id + N, device=device, dtype=torch.long)
+            final_ids      = new_ids
+            new_local_mask = torch.ones(N, dtype=torch.bool, device=device)
+            updated_next_id = next_node_id + N
+            local_id_positions = local_worlds
+        else:
+            dists = torch.cdist(local_worlds, global_worlds)   # (N, M)
+            min_dists, min_idx = torch.min(dists, dim=1)
+
+            merge_mask  = min_dists < merge_distance
+            merged_ids  = global_ids_tensor[min_idx]
+
+            new_local_mask  = ~merge_mask
+            num_new         = int(new_local_mask.sum().item())
+            new_ids         = torch.arange(next_node_id, next_node_id + num_new, device=device, dtype=torch.long)
+
+            final_ids = merged_ids.clone()
+            final_ids[new_local_mask] = new_ids
+            updated_next_id = next_node_id + num_new
+
+            # Merged nodes snap to the existing global position.
+            local_id_positions = local_worlds.clone()
+            local_id_positions[~new_local_mask] = global_worlds[min_idx[~new_local_mask]]
+
+            # Local observation overrides the stored node type for merged nodes.
+            if merge_mask.any():
+                self._global_node_types[min_idx[merge_mask]] = local_types[merge_mask]
+
+        if new_local_mask.any():
+            self._global_pos        = torch.cat([self._global_pos,        local_worlds[new_local_mask]], dim=0)
+            self._global_ids        = torch.cat([self._global_ids,        new_ids],                      dim=0)
+            self._global_node_types = torch.cat([self._global_node_types, local_types[new_local_mask]],  dim=0)
+
+        return final_ids, local_id_positions, updated_next_id
+
 
     def _dedup_edges(self) -> None:
         """Remove duplicate edges, keeping the one with the smallest weight."""
