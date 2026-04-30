@@ -18,6 +18,9 @@ class WaypointGraphGeneratorConfig:
 
     merge_node_distance: float = 0.25           # merge nodes closer than this (m)
 
+    safety_distance: float = 0.2              # robot radius / clearance (m)
+    occupancy_threshold: int = 127            # uint8 maps: values > threshold = free
+
     use_boundary_sampling: bool = True
     use_free_space_sampling: bool = True
     prune_graph: bool = True
@@ -82,10 +85,10 @@ class WaypointGraphGeneratorGPU:
 
     def build_graph_from_grid_map(
         self,
-        image: torch.Tensor,          # (H, W) on CUDA, int8 or uint8
+        image: torch.Tensor,                    # (H, W) on CUDA, int8 or uint8
         resolution: float,
-        safety_distance: float,
-        occupancy_threshold: int = 127,
+        safety_distance: float | None = None,   # overrides config.safety_distance if given
+        occupancy_threshold: int | None = None, # overrides config.occupancy_threshold if given
         x_offset: float = 0.0,
         y_offset: float = 0.0,
         rotation: float = 0.0,
@@ -95,8 +98,9 @@ class WaypointGraphGeneratorGPU:
         Args:
             image:              CUDA tensor (H, W). int8 (-1/0/100) or uint8 (0-255).
             resolution:         Meters per pixel.
-            safety_distance:    Robot radius in meters.
+            safety_distance:    Robot radius in meters. If None, uses config value.
             occupancy_threshold:Threshold for uint8 maps; ignored for int8 maps.
+                                If None, uses config value.
             x_offset, y_offset: World-frame translation of the map origin.
             rotation:           Map-to-world rotation in radians.
 
@@ -105,6 +109,11 @@ class WaypointGraphGeneratorGPU:
             node_types (N,)   int32   CUDA tensor — all 1 (free_space).
         """
         assert image.is_cuda, "image must be a CUDA tensor"
+
+        if safety_distance is None:
+            safety_distance = self._config.safety_distance
+        if occupancy_threshold is None:
+            occupancy_threshold = self._config.occupancy_threshold
 
         self._resolution = resolution
         self._safety_distance = safety_distance

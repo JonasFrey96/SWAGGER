@@ -18,3 +18,7 @@ from .waypoint_graph_generator import (  # noqa
     WaypointGraphGenerator,
     WaypointGraphGeneratorConfig,
 )
+from .waypoint_graph_generator_gpu import (
+    WaypointGraphGeneratorGPU,
+    WaypointGraphGeneratorConfig
+)
